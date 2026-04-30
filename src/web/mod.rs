@@ -586,6 +586,8 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
         )
         .route("/dashboard/sources/{id}/remove", post(remove_source))
         .route("/dashboard/sources/{id}/test", post(test_source))
+        .route("/dashboard/sources/google/connect", get(google_connect))
+        .route("/dashboard/sources/google/callback", get(google_callback))
         .route("/dashboard/sources/{id}/sync", post(sync_source))
         .route(
             "/dashboard/sources/{id}/force-sync",
@@ -638,6 +640,10 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
         .route("/dashboard/admin/auth", post(admin_update_auth))
         .route("/dashboard/admin/accent", post(admin_update_accent))
         .route("/dashboard/admin/oidc", post(admin_update_oidc))
+        .route(
+            "/dashboard/admin/google-oauth2",
+            post(admin_update_google_oauth2),
+        )
         .route("/dashboard/admin/logo", post(admin_upload_logo))
         .route("/dashboard/admin/logo/delete", post(admin_delete_logo))
         .route(
@@ -1766,8 +1772,8 @@ async fn dashboard_sources(
 ) -> impl IntoResponse {
     let user = &auth_user.user;
 
-    let sources: Vec<(String, String, String, String, Option<String>, bool, Option<String>)> = sqlx::query_as(
-        "SELECT cs.id, cs.name, cs.url, cs.username, cs.last_synced, cs.enabled, cs.write_calendar_href
+    let sources: Vec<(String, String, String, String, Option<String>, bool, Option<String>, String)> = sqlx::query_as(
+        "SELECT cs.id, cs.name, cs.url, cs.username, cs.last_synced, cs.enabled, cs.write_calendar_href, cs.auth_type
          FROM caldav_sources cs
          JOIN accounts a ON a.id = cs.account_id
          WHERE a.user_id = ?
@@ -1794,7 +1800,7 @@ async fn dashboard_sources(
     let sources_ctx: Vec<minijinja::Value> = sources
         .iter()
         .map(
-            |(id, name, url, username, last_synced, enabled, write_cal)| {
+            |(id, name, url, username, last_synced, enabled, write_cal, auth_type)| {
                 let cals: Vec<minijinja::Value> = all_calendars
                     .iter()
                     .filter(|(sid, _, _)| sid == id)
@@ -1814,6 +1820,7 @@ async fn dashboard_sources(
                     last_synced => last_synced.as_deref().unwrap_or("never"),
                     enabled => enabled,
                     write_calendar_href => write_cal.as_deref().unwrap_or(""),
+                    auth_type => auth_type,
                     calendars => cals,
                 }
             },
@@ -4380,6 +4387,7 @@ fn caldav_providers() -> Vec<(&'static str, &'static str, &'static str)> {
         ("zimbra", "Zimbra", "https://mail.example.com/dav/"),
         ("sogo", "SOGo", "https://mail.example.com/SOGo/dav/"),
         ("radicale", "Radicale", "https://cal.example.com/"),
+        ("google", "Google Calendar", ""),
         ("other", "Other / Generic CalDAV", ""),
     ]
 }
@@ -4398,6 +4406,16 @@ async fn new_source_form(
         .map(|(id, name, url)| context! { id => id, name => name, url => url })
         .collect();
 
+    let google_configured: bool = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT google_oauth2_client_id FROM auth_config LIMIT 1",
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None)
+    .flatten()
+    .map(|s| !s.is_empty())
+    .unwrap_or(false);
+
     let (impersonating, impersonating_name, _) = impersonation_ctx(&auth_user);
     Html(
         tmpl.render(context! {
@@ -4407,6 +4425,7 @@ async fn new_source_form(
             form_url => "https://mail.example.com/dav/",
             form_username => "",
             error => "",
+            google_oauth2_configured => google_configured,
             sidebar => sidebar_context(&auth_user, "sources"),
             impersonating => impersonating,
             impersonating_name => impersonating_name,
@@ -4589,8 +4608,8 @@ async fn test_source(
     }
     let user = &auth_user.user;
 
-    let source: Option<(String, String, String, String)> = sqlx::query_as(
-        "SELECT cs.url, cs.username, cs.password_enc, cs.name
+    let source: Option<(String, String, Option<String>, String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT cs.url, cs.username, cs.password_enc, cs.name, cs.auth_type, cs.access_token_enc, cs.token_expires_at
          FROM caldav_sources cs
          JOIN accounts a ON a.id = cs.account_id
          WHERE cs.id = ? AND a.user_id = ?",
@@ -4601,17 +4620,28 @@ async fn test_source(
     .await
     .unwrap_or(None);
 
-    let (url, username, password_enc, name) = match source {
-        Some(s) => s,
-        None => return Html("Source not found.".to_string()).into_response(),
-    };
+    let (url, username, password_enc, name, auth_type, access_token_enc, token_expires_at) =
+        match source {
+            Some(s) => s,
+            None => return Html("Source not found.".to_string()).into_response(),
+        };
 
-    let password = match crate::crypto::decrypt_password(&state.secret_key, &password_enc) {
-        Ok(p) => p,
+    let client = match crate::oauth2_caldav::build_client_for_source(
+        &state.pool,
+        &state.secret_key,
+        &source_id,
+        &url,
+        &auth_type,
+        &username,
+        password_enc.as_deref(),
+        access_token_enc.as_deref(),
+        token_expires_at.as_deref(),
+    )
+    .await
+    {
+        Ok(c) => c,
         Err(_) => return Html("Failed to decrypt stored credentials.".to_string()).into_response(),
     };
-
-    let client = crate::caldav::CaldavClient::new(&url, &username, &password);
     let result = match client.check_connection().await {
         Ok(true) => format!("'{}' — connection OK, CalDAV supported.", name),
         Ok(false) => format!(
@@ -4645,8 +4675,51 @@ async fn test_source(
     .into_response()
 }
 
-/// Runs CalDAV discovery + sync for a source. Returns (messages, calendar_count).
-/// On error during discovery, returns partial messages with 0 calendars.
+/// Runs CalDAV sync using build_client_for_source (supports both basic and OAuth2).
+async fn run_sync_for_source(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    source_id: &str,
+    url: &str,
+    username: &str,
+    password_enc: Option<&str>,
+    auth_type: &str,
+    access_token_enc: Option<&str>,
+    token_expires_at: Option<&str>,
+) -> (Vec<String>, usize) {
+    let client = match crate::oauth2_caldav::build_client_for_source(
+        pool,
+        key,
+        source_id,
+        url,
+        auth_type,
+        username,
+        password_enc,
+        access_token_enc,
+        token_expires_at,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => return (vec![format!("Failed to build client: {}", e)], 0),
+    };
+
+    match crate::commands::sync::sync_source(pool, key, &client, source_id).await {
+        Ok(()) => {
+            let cal_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM calendars WHERE source_id = ?")
+                    .bind(source_id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or(0);
+            (vec!["Sync complete.".to_string()], cal_count as usize)
+        }
+        Err(e) => (vec![format!("Sync failed: {}", e)], 0),
+    }
+}
+
+/// Runs CalDAV discovery + sync for a source with plaintext password (used during source creation).
+/// Returns (messages, calendar_count).
 async fn run_sync(
     pool: &SqlitePool,
     key: &[u8; 32],
@@ -4685,8 +4758,8 @@ async fn force_sync_source(
     let user = &auth_user.user;
 
     // Verify ownership
-    let source: Option<(String, String, String, String)> = sqlx::query_as(
-        "SELECT cs.id, cs.url, cs.username, cs.password_enc
+    let source: Option<(String, String, String, Option<String>, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.auth_type, cs.access_token_enc, cs.token_expires_at
          FROM caldav_sources cs JOIN accounts a ON a.id = cs.account_id
          WHERE cs.id = ? AND a.user_id = ?",
     )
@@ -4696,15 +4769,11 @@ async fn force_sync_source(
     .await
     .unwrap_or(None);
 
-    let (sid, url, username, password_enc) = match source {
-        Some(s) => s,
-        None => return Html("Source not found.".to_string()).into_response(),
-    };
-
-    let password = match crate::crypto::decrypt_password(&state.secret_key, &password_enc) {
-        Ok(p) => p,
-        Err(_) => return Html("Failed to decrypt stored credentials.".to_string()).into_response(),
-    };
+    let (sid, url, username, password_enc, auth_type, access_token_enc, token_expires_at) =
+        match source {
+            Some(s) => s,
+            None => return Html("Source not found.".to_string()).into_response(),
+        };
 
     // Clear sync tokens to force a full fetch (same as `calrs sync --full`)
     let _ = sqlx::query("UPDATE calendars SET sync_token = NULL, ctag = NULL WHERE source_id = ?")
@@ -4720,13 +4789,16 @@ async fn force_sync_source(
         .await
         .unwrap_or_else(|_| "Source".to_string());
 
-    let (messages, _) = run_sync(
+    let (messages, _) = run_sync_for_source(
         &state.pool,
         &state.secret_key,
         &sid,
         &url,
         &username,
-        &password,
+        password_enc.as_deref(),
+        &auth_type,
+        access_token_enc.as_deref(),
+        token_expires_at.as_deref(),
     )
     .await;
 
@@ -4745,8 +4817,8 @@ async fn sync_source(
     }
     let user = &auth_user.user;
 
-    let source: Option<(String, String, String, String, String)> = sqlx::query_as(
-        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.name
+    let source: Option<(String, String, String, Option<String>, String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.name, cs.auth_type, cs.access_token_enc, cs.token_expires_at
          FROM caldav_sources cs
          JOIN accounts a ON a.id = cs.account_id
          WHERE cs.id = ? AND a.user_id = ?",
@@ -4757,25 +4829,24 @@ async fn sync_source(
     .await
     .unwrap_or(None);
 
-    let (sid, url, username, password_enc, name) = match source {
-        Some(s) => s,
-        None => return Html("Source not found.".to_string()).into_response(),
-    };
-
-    let password = match crate::crypto::decrypt_password(&state.secret_key, &password_enc) {
-        Ok(p) => p,
-        Err(_) => return Html("Failed to decrypt stored credentials.".to_string()).into_response(),
-    };
+    let (sid, url, username, password_enc, name, auth_type, access_token_enc, token_expires_at) =
+        match source {
+            Some(s) => s,
+            None => return Html("Source not found.".to_string()).into_response(),
+        };
 
     tracing::info!(source_id = %sid, "CalDAV sync triggered from dashboard");
 
-    let (messages, calendar_count) = run_sync(
+    let (messages, calendar_count) = run_sync_for_source(
         &state.pool,
         &state.secret_key,
         &sid,
         &url,
         &username,
-        &password,
+        password_enc.as_deref(),
+        &auth_type,
+        access_token_enc.as_deref(),
+        token_expires_at.as_deref(),
     )
     .await;
 
@@ -11189,6 +11260,11 @@ async fn admin_dashboard(
         .as_ref()
         .map(|c| c.oidc_auto_register)
         .unwrap_or(true);
+    let google_oauth2_client_id = auth_config
+        .as_ref()
+        .and_then(|c| c.google_oauth2_client_id.clone())
+        .unwrap_or_default();
+    let google_oauth2_configured = !google_oauth2_client_id.is_empty();
 
     // Fetch SMTP config (first one found)
     let smtp: Option<(String, i32, String, bool)> =
@@ -11230,6 +11306,9 @@ async fn admin_dashboard(
             oidc_issuer_url => oidc_issuer_url,
             oidc_client_id => oidc_client_id,
             oidc_auto_register => oidc_auto_register,
+            google_oauth2_client_id => google_oauth2_client_id,
+            google_oauth2_configured => google_oauth2_configured,
+            base_url => std::env::var("CALRS_BASE_URL").unwrap_or_default(),
             smtp_configured => smtp_configured,
             smtp_host => smtp_host,
             smtp_port => smtp_port,
@@ -11473,6 +11552,256 @@ async fn admin_update_oidc(
     tracing::info!(admin = %_admin.0.email, "admin: OIDC config updated");
 
     Redirect::to("/dashboard/admin").into_response()
+}
+
+#[derive(Deserialize)]
+struct AdminGoogleOAuth2Form {
+    _csrf: Option<String>,
+    google_oauth2_client_id: Option<String>,
+    google_oauth2_client_secret: Option<String>,
+}
+
+async fn admin_update_google_oauth2(
+    State(state): State<Arc<AppState>>,
+    _admin: crate::auth::AdminUser,
+    headers: HeaderMap,
+    Form(form): Form<AdminGoogleOAuth2Form>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_csrf_token(&headers, &form._csrf) {
+        return resp;
+    }
+    let client_id = form
+        .google_oauth2_client_id
+        .filter(|s| !s.trim().is_empty());
+
+    let secret_provided = form
+        .google_oauth2_client_secret
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+
+    if secret_provided {
+        let client_secret = form.google_oauth2_client_secret.unwrap_or_default();
+        let _ = sqlx::query(
+            "UPDATE auth_config SET google_oauth2_client_id = ?, google_oauth2_client_secret = ?, updated_at = datetime('now') WHERE id = 'singleton'",
+        )
+        .bind(&client_id)
+        .bind(&client_secret)
+        .execute(&state.pool)
+        .await;
+    } else {
+        let _ = sqlx::query(
+            "UPDATE auth_config SET google_oauth2_client_id = ?, updated_at = datetime('now') WHERE id = 'singleton'",
+        )
+        .bind(&client_id)
+        .execute(&state.pool)
+        .await;
+    }
+
+    tracing::info!(admin = %_admin.0.email, "admin: Google OAuth2 config updated");
+    Redirect::to("/dashboard/admin").into_response()
+}
+
+// --- Google Calendar OAuth2 connect flow ---
+
+async fn google_connect(
+    State(state): State<Arc<AppState>>,
+    auth_user: crate::auth::AuthUser,
+) -> impl IntoResponse {
+    // Load Google OAuth2 client credentials
+    let creds: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT google_oauth2_client_id, google_oauth2_client_secret FROM auth_config LIMIT 1",
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let client_id = match creds.and_then(|(id, _)| id).filter(|s| !s.is_empty()) {
+        Some(id) => id,
+        None => {
+            return Html("Google Calendar integration is not configured. Ask your administrator to set up Google OAuth2 credentials in the admin panel.".to_string()).into_response();
+        }
+    };
+
+    let base_url = std::env::var("CALRS_BASE_URL").unwrap_or_default();
+    if base_url.is_empty() {
+        return Html(
+            "CALRS_BASE_URL environment variable must be set for OAuth2 flows.".to_string(),
+        )
+        .into_response();
+    }
+
+    let redirect_uri = format!("{}/dashboard/sources/google/callback", base_url);
+    let csrf_state = uuid::Uuid::new_v4().to_string();
+
+    let auth_url =
+        crate::oauth2_caldav::build_google_auth_url(&client_id, &redirect_uri, &csrf_state);
+
+    // Store state in cookies via Set-Cookie headers (CookieJar's String→Cookie
+    // conversion treats the whole formatted string as the cookie name and drops
+    // attributes, so set the headers directly).
+    let cookie_opts = "; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=600";
+    let state_cookie = format!("calrs_google_state={}{}", csrf_state, cookie_opts);
+    let user_cookie = format!("calrs_google_user={}{}", auth_user.user.id, cookie_opts);
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.append(
+        axum::http::header::SET_COOKIE,
+        state_cookie.parse().unwrap(),
+    );
+    headers.append(axum::http::header::SET_COOKIE, user_cookie.parse().unwrap());
+
+    (headers, Redirect::to(&auth_url)).into_response()
+}
+
+#[derive(Deserialize)]
+struct GoogleCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+async fn google_callback(
+    State(state): State<Arc<AppState>>,
+    auth_user: crate::auth::AuthUser,
+    jar: axum_extra::extract::CookieJar,
+    Query(query): Query<GoogleCallbackQuery>,
+) -> impl IntoResponse {
+    // Check for errors from Google
+    if let Some(error) = &query.error {
+        return Html(format!("Google authorization failed: {}", error)).into_response();
+    }
+
+    // Verify CSRF state
+    let stored_state = jar
+        .get("calrs_google_state")
+        .map(|c| c.value().to_string())
+        .unwrap_or_default();
+    let query_state = query.state.unwrap_or_default();
+    if stored_state.is_empty() || stored_state != query_state {
+        return Html("Invalid state parameter. Please try again.".to_string()).into_response();
+    }
+
+    let code = match query.code {
+        Some(c) => c,
+        None => return Html("No authorization code received.".to_string()).into_response(),
+    };
+
+    // Load Google OAuth2 credentials
+    let creds: Option<(String, String)> = sqlx::query_as(
+        "SELECT google_oauth2_client_id, google_oauth2_client_secret FROM auth_config LIMIT 1",
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let (client_id, client_secret) = match creds {
+        Some(c) => c,
+        None => return Html("Google OAuth2 not configured.".to_string()).into_response(),
+    };
+
+    let base_url = std::env::var("CALRS_BASE_URL").unwrap_or_default();
+    let redirect_uri = format!("{}/dashboard/sources/google/callback", base_url);
+
+    // Exchange code for tokens
+    let (access_token, refresh_token, expires_in) =
+        match crate::oauth2_caldav::exchange_google_code(
+            &client_id,
+            &client_secret,
+            &code,
+            &redirect_uri,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => return Html(format!("Token exchange failed: {}", e)).into_response(),
+        };
+
+    // Identify the Google account that authorized us — its email is what goes in the CalDAV URL.
+    // The local calrs user's email is unrelated and may not match the Google account.
+    let google_email = match crate::oauth2_caldav::fetch_google_email(&access_token).await {
+        Ok(e) => e,
+        Err(e) => {
+            return Html(format!("Failed to fetch Google account email: {}", e)).into_response();
+        }
+    };
+    let caldav_url = crate::oauth2_caldav::google_caldav_url_for_email(&google_email);
+
+    // Test the CalDAV connection (PROPFIND requires the per-user URL)
+    let client = crate::caldav::CaldavClient::with_bearer(&caldav_url, &access_token);
+    if let Err(e) = client.check_connection().await {
+        tracing::warn!(error = %e, "Google CalDAV connection test failed (non-fatal)");
+    }
+
+    // Get user's account
+    let account: Option<(String,)> =
+        sqlx::query_as("SELECT a.id FROM accounts a WHERE a.user_id = ? LIMIT 1")
+            .bind(&auth_user.user.id)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+
+    let account_id = match account {
+        Some((id,)) => id,
+        None => return Html("No scheduling account found.".to_string()).into_response(),
+    };
+
+    // Encrypt tokens
+    let access_token_enc = match crate::crypto::encrypt_password(&state.secret_key, &access_token) {
+        Ok(enc) => enc,
+        Err(_) => return Html("Encryption error.".to_string()).into_response(),
+    };
+    let refresh_token_enc = match crate::crypto::encrypt_password(&state.secret_key, &refresh_token)
+    {
+        Ok(enc) => enc,
+        Err(_) => return Html("Encryption error.".to_string()).into_response(),
+    };
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(expires_in);
+
+    // Create the CalDAV source
+    let source_id = uuid::Uuid::new_v4().to_string();
+    let _ = sqlx::query(
+        "INSERT INTO caldav_sources (id, account_id, name, url, username, auth_type, oauth2_provider, access_token_enc, refresh_token_enc, token_expires_at)
+         VALUES (?, ?, 'Google Calendar', ?, ?, 'oauth2', 'google', ?, ?, ?)",
+    )
+    .bind(&source_id)
+    .bind(&account_id)
+    .bind(&caldav_url)
+    .bind(&google_email)
+    .bind(&access_token_enc)
+    .bind(&refresh_token_enc)
+    .bind(expires_at.to_rfc3339())
+    .execute(&state.pool)
+    .await;
+
+    tracing::info!(user = %auth_user.user.email, google_email = %google_email, "Google Calendar source added via OAuth2");
+
+    // Auto-sync
+    let (_, calendar_count) = run_sync_for_source(
+        &state.pool,
+        &state.secret_key,
+        &source_id,
+        &caldav_url,
+        &google_email,
+        None,
+        "oauth2",
+        Some(&access_token_enc),
+        Some(&expires_at.to_rfc3339()),
+    )
+    .await;
+
+    // Clear transient cookies
+    let jar = jar.remove("calrs_google_state").remove("calrs_google_user");
+
+    if calendar_count > 0 {
+        (
+            jar,
+            Redirect::to(&format!("/dashboard/sources/{}/setup-write", source_id)),
+        )
+            .into_response()
+    } else {
+        (jar, Redirect::to("/dashboard/sources")).into_response()
+    }
 }
 
 // --- Logo management ---
@@ -13123,8 +13452,8 @@ async fn caldav_push_booking(
     details: &crate::email::BookingDetails,
 ) {
     // Find all CalDAV sources with write_calendar_href configured for this user
-    let sources: Vec<(String, String, String, String)> = sqlx::query_as(
-        "SELECT cs.url, cs.username, cs.password_enc, cs.write_calendar_href
+    let sources: Vec<(String, String, String, Option<String>, String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.write_calendar_href, cs.auth_type, cs.access_token_enc, cs.token_expires_at
          FROM caldav_sources cs
          JOIN accounts a ON a.id = cs.account_id
          WHERE a.user_id = ? AND cs.enabled = 1 AND cs.write_calendar_href IS NOT NULL",
@@ -13141,16 +13470,36 @@ async fn caldav_push_booking(
 
     let ics = crate::email::generate_ics(details, "");
 
-    for (url, username, password_enc, calendar_href) in &sources {
-        let password = match crate::crypto::decrypt_password(key, password_enc) {
-            Ok(p) => p,
+    for (
+        source_id,
+        url,
+        username,
+        password_enc,
+        calendar_href,
+        auth_type,
+        access_token_enc,
+        token_expires_at,
+    ) in &sources
+    {
+        let client = match crate::oauth2_caldav::build_client_for_source(
+            pool,
+            key,
+            source_id,
+            url,
+            auth_type,
+            username,
+            password_enc.as_deref(),
+            access_token_enc.as_deref(),
+            token_expires_at.as_deref(),
+        )
+        .await
+        {
+            Ok(c) => c,
             Err(e) => {
-                tracing::error!(url = %url, error = %e, "CalDAV write-back failed: could not decrypt credentials");
+                tracing::error!(url = %url, error = %e, "CalDAV write-back failed: could not build client");
                 continue;
             }
         };
-
-        let client = crate::caldav::CaldavClient::new(url, username, &password);
 
         tracing::debug!(uid = %booking_uid, calendar_href = %calendar_href, "pushing booking to CalDAV");
 
@@ -13178,8 +13527,8 @@ async fn caldav_delete_for_user(
     user_id: &str,
     booking_uid: &str,
 ) {
-    let sources: Vec<(String, String, String, String)> = sqlx::query_as(
-        "SELECT cs.url, cs.username, cs.password_enc, cs.write_calendar_href
+    let sources: Vec<(String, String, String, Option<String>, String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.write_calendar_href, cs.auth_type, cs.access_token_enc, cs.token_expires_at
          FROM caldav_sources cs
          JOIN accounts a ON a.id = cs.account_id
          WHERE a.user_id = ? AND cs.enabled = 1 AND cs.write_calendar_href IS NOT NULL",
@@ -13189,13 +13538,33 @@ async fn caldav_delete_for_user(
     .await
     .unwrap_or_default();
 
-    for (url, username, password_enc, calendar_href) in &sources {
-        let password = match crate::crypto::decrypt_password(key, password_enc) {
-            Ok(p) => p,
+    for (
+        source_id,
+        url,
+        username,
+        password_enc,
+        calendar_href,
+        auth_type,
+        access_token_enc,
+        token_expires_at,
+    ) in &sources
+    {
+        let client = match crate::oauth2_caldav::build_client_for_source(
+            pool,
+            key,
+            source_id,
+            url,
+            auth_type,
+            username,
+            password_enc.as_deref(),
+            access_token_enc.as_deref(),
+            token_expires_at.as_deref(),
+        )
+        .await
+        {
+            Ok(c) => c,
             Err(_) => continue,
         };
-
-        let client = crate::caldav::CaldavClient::new(url, username, &password);
         if let Err(e) = client.delete_event(calendar_href, booking_uid).await {
             tracing::error!(uid = %booking_uid, user = %user_id, calendar = %calendar_href, error = %e, "CalDAV event delete failed");
         }
@@ -13238,8 +13607,8 @@ async fn caldav_delete_booking(
     };
 
     // Get the CalDAV source credentials
-    let source: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT cs.url, cs.username, cs.password_enc
+    let source: Option<(String, String, String, Option<String>, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.auth_type, cs.access_token_enc, cs.token_expires_at
          FROM caldav_sources cs
          JOIN accounts a ON a.id = cs.account_id
          WHERE a.user_id = ? AND cs.enabled = 1 AND cs.write_calendar_href = ?
@@ -13251,17 +13620,28 @@ async fn caldav_delete_booking(
     .await
     .unwrap_or(None);
 
-    let (url, username, password_enc) = match source {
-        Some(s) => s,
-        None => return,
-    };
+    let (source_id, url, username, password_enc, auth_type, access_token_enc, token_expires_at) =
+        match source {
+            Some(s) => s,
+            None => return,
+        };
 
-    let password = match crate::crypto::decrypt_password(key, &password_enc) {
-        Ok(p) => p,
+    let client = match crate::oauth2_caldav::build_client_for_source(
+        pool,
+        key,
+        &source_id,
+        &url,
+        &auth_type,
+        &username,
+        password_enc.as_deref(),
+        access_token_enc.as_deref(),
+        token_expires_at.as_deref(),
+    )
+    .await
+    {
+        Ok(c) => c,
         Err(_) => return,
     };
-
-    let client = crate::caldav::CaldavClient::new(&url, &username, &password);
     if let Err(e) = client.delete_event(&calendar_href, booking_uid).await {
         tracing::error!(uid = %booking_uid, error = %e, "CalDAV event delete failed");
     }

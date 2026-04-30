@@ -1,14 +1,23 @@
 use anyhow::{bail, Result};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use std::net::IpAddr;
 use std::time::Duration;
+
+/// Host portion of Google's CalDAV API. Used to short-circuit the discovery
+/// flow, since Google's PROPFIND responses don't follow RFC 4791 closely
+/// enough for the standard discovery to work, and the URL pattern is fixed.
+const GOOGLE_CALDAV_HOST: &str = "apidata.googleusercontent.com";
+
+pub enum CaldavAuth {
+    Basic { username: String, password: String },
+    Bearer { access_token: String },
+}
 
 pub struct CaldavClient {
     client: Client,
     base_url: String,
     origin: String,
-    username: String,
-    password: String,
+    auth: CaldavAuth,
 }
 
 /// Check if an IP address is in a private/reserved range (SSRF protection).
@@ -89,6 +98,25 @@ pub fn validate_caldav_url(url: &str) -> Result<()> {
 
 impl CaldavClient {
     pub fn new(base_url: &str, username: &str, password: &str) -> Self {
+        Self::build(
+            base_url,
+            CaldavAuth::Basic {
+                username: username.to_string(),
+                password: password.to_string(),
+            },
+        )
+    }
+
+    pub fn with_bearer(base_url: &str, access_token: &str) -> Self {
+        Self::build(
+            base_url,
+            CaldavAuth::Bearer {
+                access_token: access_token.to_string(),
+            },
+        )
+    }
+
+    fn build(base_url: &str, auth: CaldavAuth) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -106,8 +134,16 @@ impl CaldavClient {
             client,
             base_url: base,
             origin,
-            username: username.to_string(),
-            password: password.to_string(),
+            auth,
+        }
+    }
+
+    fn apply_auth(&self, builder: RequestBuilder) -> RequestBuilder {
+        match &self.auth {
+            CaldavAuth::Basic { username, password } => {
+                builder.basic_auth(username, Some(password))
+            }
+            CaldavAuth::Bearer { access_token } => builder.bearer_auth(access_token),
         }
     }
 
@@ -123,20 +159,26 @@ impl CaldavClient {
     /// Send a PROPFIND request and return the response body
     async fn propfind(&self, url: &str, depth: &str, body: &str) -> Result<String> {
         tracing::debug!(url = %url, depth = %depth, "sending PROPFIND request");
-        let resp = self
+        let req = self
             .client
-            .request(reqwest::Method::from_bytes(b"PROPFIND")?, url)
-            .basic_auth(&self.username, Some(&self.password))
+            .request(reqwest::Method::from_bytes(b"PROPFIND")?, url);
+        let resp = self
+            .apply_auth(req)
             .header("Content-Type", "application/xml; charset=utf-8")
             .header("Depth", depth)
             .body(body.to_string())
             .send()
             .await?;
 
-        tracing::debug!(url = %url, status = %resp.status(), "PROPFIND response received");
+        let status = resp.status();
+        tracing::debug!(url = %url, status = %status, "PROPFIND response received");
 
-        if !resp.status().is_success() && resp.status().as_u16() != 207 {
-            bail!("PROPFIND {} returned {}", url, resp.status());
+        if !status.is_success() && status.as_u16() != 207 {
+            // Surface the response body — servers like Google embed the actual reason
+            // (insufficient scope, API not enabled, etc.) in the body, not the status line.
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(500).collect();
+            bail!("PROPFIND {} returned {} — {}", url, status, snippet);
         }
 
         Ok(resp.text().await?)
@@ -144,12 +186,10 @@ impl CaldavClient {
 
     /// Check if the server supports CalDAV (OPTIONS request)
     pub async fn check_connection(&self) -> Result<bool> {
-        let resp = self
+        let req = self
             .client
-            .request(reqwest::Method::OPTIONS, &self.base_url)
-            .basic_auth(&self.username, Some(&self.password))
-            .send()
-            .await?;
+            .request(reqwest::Method::OPTIONS, &self.base_url);
+        let resp = self.apply_auth(req).send().await?;
 
         if !resp.status().is_success() {
             bail!(
@@ -172,6 +212,15 @@ impl CaldavClient {
 
     /// Discover the current-user-principal URL via PROPFIND
     pub async fn discover_principal(&self) -> Result<String> {
+        // Google CalDAV doesn't return <current-user-principal> in a way the
+        // standard discovery flow can use — but the URL we configure for Google
+        // OAuth2 sources is already the per-user principal endpoint, so skip the
+        // round-trip and return it directly.
+        if self.base_url.contains(GOOGLE_CALDAV_HOST) {
+            tracing::debug!(principal = %self.base_url, "using Google CalDAV principal URL directly");
+            return Ok(self.base_url.clone());
+        }
+
         let text = self
             .propfind(&self.base_url, "0", PROPFIND_PRINCIPAL)
             .await?;
@@ -238,10 +287,9 @@ impl CaldavClient {
         let href = format!("{}/{}.ics", calendar_href.trim_end_matches('/'), uid);
         let url = self.resolve_url(&href);
 
+        let req = self.client.put(&url);
         let resp = self
-            .client
-            .put(&url)
-            .basic_auth(&self.username, Some(&self.password))
+            .apply_auth(req)
             .header("Content-Type", "text/calendar; charset=utf-8")
             .body(ics_data.to_string())
             .send()
@@ -261,12 +309,8 @@ impl CaldavClient {
         let href = format!("{}/{}.ics", calendar_href.trim_end_matches('/'), uid);
         let url = self.resolve_url(&href);
 
-        let resp = self
-            .client
-            .delete(&url)
-            .basic_auth(&self.username, Some(&self.password))
-            .send()
-            .await?;
+        let req = self.client.delete(&url);
+        let resp = self.apply_auth(req).send().await?;
 
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 204 && status.as_u16() != 404 {
@@ -282,10 +326,11 @@ impl CaldavClient {
         let url = self.resolve_url(calendar_href);
 
         // Use a longer timeout for event fetches (calendars can be large)
-        let resp = self
+        let req = self
             .client
-            .request(reqwest::Method::from_bytes(b"REPORT")?, &url)
-            .basic_auth(&self.username, Some(&self.password))
+            .request(reqwest::Method::from_bytes(b"REPORT")?, &url);
+        let resp = self
+            .apply_auth(req)
             .header("Content-Type", "application/xml; charset=utf-8")
             .header("Depth", "1")
             .timeout(Duration::from_secs(60))
@@ -321,10 +366,11 @@ impl CaldavClient {
             token_value
         );
 
-        let resp = self
+        let req = self
             .client
-            .request(reqwest::Method::from_bytes(b"REPORT")?, &url)
-            .basic_auth(&self.username, Some(&self.password))
+            .request(reqwest::Method::from_bytes(b"REPORT")?, &url);
+        let resp = self
+            .apply_auth(req)
             .header("Content-Type", "application/xml; charset=utf-8")
             .timeout(Duration::from_secs(60))
             .body(body)
@@ -372,10 +418,11 @@ impl CaldavClient {
             since_utc
         );
 
-        let resp = self
+        let req = self
             .client
-            .request(reqwest::Method::from_bytes(b"REPORT")?, &url)
-            .basic_auth(&self.username, Some(&self.password))
+            .request(reqwest::Method::from_bytes(b"REPORT")?, &url);
+        let resp = self
+            .apply_auth(req)
             .header("Content-Type", "application/xml; charset=utf-8")
             .header("Depth", "1")
             .timeout(Duration::from_secs(60))
@@ -1132,5 +1179,19 @@ END:VCALENDAR</c:calendar-data>
     fn client_trims_trailing_slash() {
         let client = CaldavClient::new("https://cloud.example.com/dav/", "u", "p");
         assert_eq!(client.base_url, "https://cloud.example.com/dav");
+    }
+
+    // Google CalDAV's PROPFIND on the base URL doesn't reliably expose
+    // <current-user-principal>, but the URL we configure for Google OAuth2
+    // sources is already the per-user principal endpoint, so discover_principal
+    // short-circuits and returns it directly. discover_calendar_home then does
+    // a real PROPFIND so any error from Google surfaces with its actual body.
+    #[tokio::test]
+    async fn google_discover_principal_short_circuits() {
+        let url = "https://apidata.googleusercontent.com/caldav/v2/alice%40gmail.com/user";
+        let client = CaldavClient::with_bearer(url, "fake-token");
+
+        let principal = client.discover_principal().await.unwrap();
+        assert_eq!(principal, url);
     }
 }

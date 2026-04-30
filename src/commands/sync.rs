@@ -10,9 +10,15 @@ use crate::utils::{extract_vevent_field, extract_vevent_tzid, split_vevents};
 /// Default staleness threshold: 5 minutes
 const STALE_SECS: i64 = 300;
 
+/// Look-back window for full-fetch path. Bounded so Google CalDAV — which
+/// truncates the forward window of unfiltered REPORTs — returns future events
+/// via the `time-range` filter. 90 days keeps recent history available for
+/// orphan/cancellation detection without ballooning the response.
+const FULL_FETCH_LOOKBACK_DAYS: i64 = 90;
+
 pub async fn run(pool: &SqlitePool, key: &[u8; 32], full: bool) -> Result<()> {
-    let sources: Vec<(String, String, String, String, String)> = sqlx::query_as(
-        "SELECT id, name, url, username, password_enc FROM caldav_sources WHERE enabled = 1",
+    let sources: Vec<(String, String, String, String, Option<String>, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, name, url, username, password_enc, auth_type, access_token_enc, token_expires_at FROM caldav_sources WHERE enabled = 1",
     )
     .fetch_all(pool)
     .await?;
@@ -22,11 +28,31 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], full: bool) -> Result<()> {
         return Ok(());
     }
 
-    for (source_id, name, url, username, password_enc) in &sources {
+    for (
+        source_id,
+        name,
+        url,
+        username,
+        password_enc,
+        auth_type,
+        access_token_enc,
+        token_expires_at,
+    ) in &sources
+    {
         println!("{} Syncing '{}'…", "…".dimmed(), name);
 
-        let password = crate::crypto::decrypt_password(key, password_enc)?;
-        let client = CaldavClient::new(url, username, &password);
+        let client = crate::oauth2_caldav::build_client_for_source(
+            pool,
+            key,
+            source_id,
+            url,
+            auth_type,
+            username,
+            password_enc.as_deref(),
+            access_token_enc.as_deref(),
+            token_expires_at.as_deref(),
+        )
+        .await?;
 
         if full {
             // Clear sync tokens to force a full fetch
@@ -137,13 +163,24 @@ pub async fn sync_source(
 
         if !delta_ok {
             did_full_sync = true;
-            // Full fetch fallback
-            match client.fetch_events(&cal_info.href).await {
+            // Full fetch fallback. Bounded with a `time-range` filter so Google
+            // CalDAV returns future events (its unfiltered REPORT truncates the
+            // forward window). fetch_events_since falls back to the unfiltered
+            // REPORT if the server rejects time-range, so other servers are
+            // unaffected.
+            let since_dt = Utc::now() - chrono::Duration::days(FULL_FETCH_LOOKBACK_DAYS);
+            let since_iso = since_dt.format("%Y%m%dT%H%M%SZ").to_string();
+            let since_prefix = since_dt.format("%Y%m%d").to_string();
+            match client.fetch_events_since(&cal_info.href, &since_iso).await {
                 Ok(raw_events) => {
                     let count = upsert_raw_events(pool, &cal_id, &raw_events).await;
 
-                    // Remove events that no longer exist on the server
-                    let deleted = remove_orphaned_events(pool, key, &cal_id, &raw_events).await;
+                    // Remove events that no longer exist on the server, but only
+                    // within the fetched window — older events weren't in the
+                    // response by design and must not be treated as orphans.
+                    let deleted =
+                        remove_orphaned_events(pool, key, &cal_id, &raw_events, &since_prefix)
+                            .await;
                     if deleted > 0 {
                         tracing::info!(
                             calendar_name = cal_label,
@@ -215,8 +252,8 @@ pub async fn sync_if_stale(pool: &SqlitePool, key: &[u8; 32], user_id: &str) {
     // Must match SQLite datetime('now') format: "YYYY-MM-DD HH:MM:SS" (space, not T)
     let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
 
-    let stale_sources: Vec<(String, String, String, String)> = sqlx::query_as(
-        "SELECT cs.id, cs.url, cs.username, cs.password_enc
+    let stale_sources: Vec<(String, String, String, Option<String>, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.auth_type, cs.access_token_enc, cs.token_expires_at
          FROM caldav_sources cs
          JOIN accounts a ON a.id = cs.account_id
          WHERE a.user_id = ? AND cs.enabled = 1
@@ -234,12 +271,25 @@ pub async fn sync_if_stale(pool: &SqlitePool, key: &[u8; 32], user_id: &str) {
 
     tracing::debug!(user_id = %user_id, "on-demand CalDAV sync triggered (stale >5min)");
 
-    for (source_id, url, username, password_enc) in &stale_sources {
-        let password = match crate::crypto::decrypt_password(key, password_enc) {
-            Ok(p) => p,
+    for (source_id, url, username, password_enc, auth_type, access_token_enc, token_expires_at) in
+        &stale_sources
+    {
+        let client = match crate::oauth2_caldav::build_client_for_source(
+            pool,
+            key,
+            source_id,
+            url,
+            auth_type,
+            username,
+            password_enc.as_deref(),
+            access_token_enc.as_deref(),
+            token_expires_at.as_deref(),
+        )
+        .await
+        {
+            Ok(c) => c,
             Err(_) => continue,
         };
-        let client = CaldavClient::new(url, username, &password);
         let _ = sync_source(pool, key, &client, source_id).await;
     }
 }
@@ -247,20 +297,25 @@ pub async fn sync_if_stale(pool: &SqlitePool, key: &[u8; 32], user_id: &str) {
 /// Sync a single source by ID (for background sync loop).
 /// Forces a full resync if last_full_sync is >24h ago (catches orphaned events).
 pub async fn sync_source_by_id(pool: &SqlitePool, key: &[u8; 32], source_id: &str) {
-    let source: Option<(String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT url, username, password_enc, last_full_sync FROM caldav_sources WHERE id = ? AND enabled = 1",
+    let source: Option<(String, String, Option<String>, Option<String>, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT url, username, password_enc, last_full_sync, auth_type, access_token_enc, token_expires_at FROM caldav_sources WHERE id = ? AND enabled = 1",
     )
     .bind(source_id)
     .fetch_optional(pool)
     .await
     .unwrap_or(None);
 
-    let Some((url, username, password_enc, last_full_sync)) = source else {
+    let Some((
+        url,
+        username,
+        password_enc,
+        last_full_sync,
+        auth_type,
+        access_token_enc,
+        token_expires_at,
+    )) = source
+    else {
         return;
-    };
-    let password = match crate::crypto::decrypt_password(key, &password_enc) {
-        Ok(p) => p,
-        Err(_) => return,
     };
 
     // Force full resync if last_full_sync is >24h ago or never done
@@ -281,7 +336,22 @@ pub async fn sync_source_by_id(pool: &SqlitePool, key: &[u8; 32], source_id: &st
                 .await;
     }
 
-    let client = CaldavClient::new(&url, &username, &password);
+    let client = match crate::oauth2_caldav::build_client_for_source(
+        pool,
+        key,
+        source_id,
+        &url,
+        &auth_type,
+        &username,
+        password_enc.as_deref(),
+        access_token_enc.as_deref(),
+        token_expires_at.as_deref(),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
     let _ = sync_source(pool, key, &client, source_id).await;
 }
 
@@ -424,11 +494,15 @@ async fn delete_events_by_href(
 }
 
 /// Remove local events that no longer exist on the server (full sync orphan cleanup).
+/// `since_prefix` bounds the orphan check to events whose start_at falls inside
+/// the fetched window — older events weren't in the response and must not be
+/// deleted as orphans. Pass an empty string to consider all local events.
 async fn remove_orphaned_events(
     pool: &SqlitePool,
     key: &[u8; 32],
     cal_id: &str,
     raw_events: &[RawEvent],
+    since_prefix: &str,
 ) -> u32 {
     // Build set of seen (uid, recurrence_id) pairs
     let mut seen_uids: Vec<(String, String)> = Vec::new();
@@ -447,12 +521,20 @@ async fn remove_orphaned_events(
         return 0;
     }
 
-    let local_events: Vec<(String, String, Option<String>)> =
-        sqlx::query_as("SELECT id, uid, recurrence_id FROM events WHERE calendar_id = ?")
-            .bind(cal_id)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
+    // Scope the orphan check to events whose start_at falls inside the fetched
+    // window. Both compact ("YYYYMMDDTHHMMSS") and all-day ("YYYYMMDD")
+    // encodings sort correctly against an 8-char "YYYYMMDD" lower bound.
+    let local_events: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, uid, recurrence_id FROM events
+         WHERE calendar_id = ?
+           AND (? = '' OR start_at >= ?)",
+    )
+    .bind(cal_id)
+    .bind(since_prefix)
+    .bind(since_prefix)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
 
     tracing::debug!(
         calendar_id = %cal_id,

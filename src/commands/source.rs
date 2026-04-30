@@ -5,9 +5,7 @@ use sqlx::SqlitePool;
 use tabled::{Table, Tabled};
 use uuid::Uuid;
 
-use crate::caldav::CaldavClient;
-
-use std::io::{self, Write};
+use std::io::{self, Read as _, Write};
 
 use crate::utils::prompt;
 
@@ -39,6 +37,12 @@ pub enum SourceCommands {
     Test {
         /// Source ID
         id: String,
+    },
+    /// Connect a Google Calendar via OAuth2
+    AddGoogle {
+        /// Display name for this source
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -79,7 +83,7 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: SourceCommands) -> Resu
                 print!("{} Testing connection… ", "…".dimmed());
                 io::stdout().flush().unwrap();
 
-                let client = CaldavClient::new(&url, &username, &password);
+                let client = crate::caldav::CaldavClient::new(&url, &username, &password);
                 match client.check_connection().await {
                     Ok(true) => println!("{}", "CalDAV supported".green()),
                     Ok(false) => {
@@ -161,19 +165,37 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: SourceCommands) -> Resu
             }
         }
         SourceCommands::Test { id } => {
-            let source: Option<(String, String, String, String)> = sqlx::query_as(
-                "SELECT url, username, password_enc, name FROM caldav_sources WHERE id LIKE ? || '%'",
+            let source: Option<(String, String, String, String, Option<String>, String, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT id, url, username, name, password_enc, auth_type, access_token_enc, token_expires_at FROM caldav_sources WHERE id LIKE ? || '%'",
             )
             .bind(&id)
             .fetch_optional(pool)
             .await?;
 
             match source {
-                Some((url, username, password_enc, name)) => {
-                    let password = crate::crypto::decrypt_password(key, &password_enc)?;
-
+                Some((
+                    source_id,
+                    url,
+                    username,
+                    name,
+                    password_enc,
+                    auth_type,
+                    access_token_enc,
+                    token_expires_at,
+                )) => {
                     println!("Testing source '{}'…", name);
-                    let client = CaldavClient::new(&url, &username, &password);
+                    let client = crate::oauth2_caldav::build_client_for_source(
+                        pool,
+                        key,
+                        &source_id,
+                        &url,
+                        &auth_type,
+                        &username,
+                        password_enc.as_deref(),
+                        access_token_enc.as_deref(),
+                        token_expires_at.as_deref(),
+                    )
+                    .await?;
                     match client.check_connection().await {
                         Ok(true) => println!("{} Connection OK — CalDAV supported", "✓".green()),
                         Ok(false) => println!("{} Connected but CalDAV not detected", "⚠".yellow()),
@@ -184,6 +206,162 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: SourceCommands) -> Resu
                     println!("{} No source found matching '{}'", "✗".red(), id);
                 }
             }
+        }
+        SourceCommands::AddGoogle { name } => {
+            let account: (String,) = sqlx::query_as("SELECT id FROM accounts LIMIT 1")
+                .fetch_optional(pool)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("No account found. Run `calrs init` first."))?;
+
+            let (client_id, client_secret): (Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT google_oauth2_client_id, google_oauth2_client_secret FROM auth_config LIMIT 1",
+            )
+            .fetch_optional(pool)
+            .await?
+            .unwrap_or((None, None));
+
+            let client_id = client_id
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Google OAuth2 not configured. Set credentials via `calrs config` or the admin panel."))?;
+            let client_secret = client_secret
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Google OAuth2 client secret not configured."))?;
+
+            let name = name.unwrap_or_else(|| prompt("Display name"));
+
+            // Bind a temporary TCP listener on a random port for the OAuth2 callback
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let port = listener.local_addr()?.port();
+            let redirect_uri = format!("http://localhost:{port}/callback");
+
+            let state = Uuid::new_v4().to_string();
+            let auth_url =
+                crate::oauth2_caldav::build_google_auth_url(&client_id, &redirect_uri, &state);
+
+            println!("\nOpen this URL in your browser to authorize calrs:\n");
+            println!("  {}\n", auth_url);
+
+            // Try to open browser automatically
+            if open::that(&auth_url).is_err() {
+                println!("(Could not open browser automatically — please copy the URL above.)");
+            }
+
+            println!("{} Waiting for authorization…", "…".dimmed());
+
+            // Accept one connection and read the HTTP request
+            let (mut stream, _) = listener.accept()?;
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf)?;
+            let request = String::from_utf8_lossy(&buf[..n]);
+
+            // Parse the GET request line to extract query parameters
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("");
+
+            // Send a response to the browser
+            let response_body = "<html><body><h2>Authorization complete!</h2><p>You can close this tab and return to the terminal.</p></body></html>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            drop(stream);
+
+            // Extract code and state from query string
+            let query = path.split('?').nth(1).unwrap_or("");
+            let params: std::collections::HashMap<&str, &str> = query
+                .split('&')
+                .filter_map(|pair| {
+                    let mut parts = pair.splitn(2, '=');
+                    Some((parts.next()?, parts.next()?))
+                })
+                .collect();
+
+            if let Some(error) = params.get("error") {
+                bail!("Authorization failed: {}", error);
+            }
+
+            let callback_state = params.get("state").unwrap_or(&"");
+            if *callback_state != state {
+                bail!("CSRF state mismatch — possible security issue. Please try again.");
+            }
+
+            let code = params
+                .get("code")
+                .ok_or_else(|| anyhow::anyhow!("No authorization code received"))?;
+
+            print!("{} Exchanging code for tokens… ", "…".dimmed());
+            io::stdout().flush().unwrap();
+
+            let (access_token, refresh_token, expires_in) =
+                crate::oauth2_caldav::exchange_google_code(
+                    &client_id,
+                    &client_secret,
+                    code,
+                    &redirect_uri,
+                )
+                .await?;
+            println!("{}", "OK".green());
+
+            // Fetch the Google account email — it identifies the principal in the CalDAV URL.
+            let username = crate::oauth2_caldav::fetch_google_email(&access_token).await?;
+            let caldav_url = crate::oauth2_caldav::google_caldav_url_for_email(&username);
+
+            // Test CalDAV connection (PROPFIND requires the per-user URL)
+            print!("{} Testing CalDAV connection… ", "…".dimmed());
+            io::stdout().flush().unwrap();
+
+            let client = crate::caldav::CaldavClient::with_bearer(&caldav_url, &access_token);
+            match client.check_connection().await {
+                Ok(true) => println!("{}", "CalDAV supported".green()),
+                Ok(false) => {
+                    println!(
+                        "{}",
+                        "Connected but CalDAV not detected in DAV header".yellow()
+                    );
+                    println!("Continuing anyway…");
+                }
+                Err(e) => {
+                    println!("{} {}", "✗".red(), e);
+                    bail!("CalDAV connection failed: {}", e);
+                }
+            }
+
+            // Encrypt and store tokens
+            let access_token_enc = crate::crypto::encrypt_password(key, &access_token)?;
+            let refresh_token_enc = crate::crypto::encrypt_password(key, &refresh_token)?;
+            let expires_at =
+                (chrono::Utc::now() + chrono::Duration::seconds(expires_in)).to_rfc3339();
+
+            let id = Uuid::new_v4().to_string();
+
+            sqlx::query(
+                "INSERT INTO caldav_sources (id, account_id, name, url, username, password_enc, auth_type, oauth2_provider, access_token_enc, refresh_token_enc, token_expires_at) VALUES (?, ?, ?, ?, ?, ?, 'oauth2', 'google', ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(&account.0)
+            .bind(&name)
+            .bind(&caldav_url)
+            .bind(&username)
+            .bind("")  // password_enc NOT NULL, empty for OAuth2
+            .bind(&access_token_enc)
+            .bind(&refresh_token_enc)
+            .bind(&expires_at)
+            .execute(pool)
+            .await?;
+
+            println!(
+                "{} Google Calendar source '{}' added (id: {}, user: {})",
+                "✓".green(),
+                name,
+                &id[..8],
+                username
+            );
+            println!("Run `calrs sync` to fetch your calendars.");
         }
     }
 

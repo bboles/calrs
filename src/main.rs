@@ -13,6 +13,7 @@ mod crypto;
 mod db;
 mod email;
 mod models;
+mod oauth2_caldav;
 mod rrule;
 mod utils;
 mod web;

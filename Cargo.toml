@@ -73,6 +73,9 @@ urlencoding = "2"
 # Markdown (bio rendering)
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 
+# Browser launch (CLI OAuth2)
+open = "5"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

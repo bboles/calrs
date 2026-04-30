@@ -53,6 +53,8 @@ pub struct AuthConfig {
     pub oidc_client_id: Option<String>,
     pub oidc_client_secret: Option<String>,
     pub oidc_auto_register: bool,
+    pub google_oauth2_client_id: Option<String>,
+    pub google_oauth2_client_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -77,6 +79,11 @@ pub struct CaldavSource {
     pub sync_token: Option<String>,
     pub enabled: bool,
     pub created_at: String,
+    pub auth_type: String,
+    pub oauth2_provider: Option<String>,
+    pub access_token_enc: Option<String>,
+    pub refresh_token_enc: Option<String>,
+    pub token_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

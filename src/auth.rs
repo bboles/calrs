@@ -421,6 +421,8 @@ async fn register_page(State(state): State<Arc<AppState>>, jar: CookieJar) -> Re
         oidc_client_id: None,
         oidc_client_secret: None,
         oidc_auto_register: true,
+        google_oauth2_client_id: None,
+        google_oauth2_client_secret: None,
     });
 
     if !auth_config.registration_enabled {

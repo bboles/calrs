@@ -306,6 +306,33 @@ document.querySelectorAll('input[type="color"]').forEach(function(picker) {
   </form>
 </div>
 
+<!-- Google Calendar OAuth2 -->
+<div class="card">
+  <h2>Google Calendar (OAuth2)</h2>
+  <div style="margin-bottom: 1rem; font-size: 0.875rem; color: var(--text-secondary);">
+    Status: {% if google_oauth2_configured %}<strong style="color: var(--success);">configured</strong>{% else %}<span style="color: var(--text-muted);">not configured</span>{% endif %}
+    {% if google_oauth2_client_id %}&middot; Client ID: <span style="color: var(--text-muted);">{{ google_oauth2_client_id }}</span>{% endif %}
+  </div>
+  <form method="post" action="/dashboard/admin/google-oauth2">
+    <p style="font-size: 0.825rem; color: var(--text-muted); margin-bottom: 1rem;">
+      To enable Google Calendar integration, create OAuth2 credentials at
+      <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color: var(--accent);">Google Cloud Console</a>.
+      Enable the <strong>Google Calendar API</strong>, then add
+      <code>{{ base_url }}/dashboard/sources/google/callback</code>
+      as an authorized redirect URI.
+    </p>
+    <div class="form-group">
+      <label>Client ID</label>
+      <input type="text" name="google_oauth2_client_id" value="{{ google_oauth2_client_id }}" placeholder="123456789.apps.googleusercontent.com">
+    </div>
+    <div class="form-group">
+      <label>Client secret <span class="hint">(leave empty to keep current)</span></label>
+      <input type="password" name="google_oauth2_client_secret" value="" placeholder="Leave empty to keep unchanged">
+    </div>
+    <button type="submit" class="slot-btn" style="cursor: pointer; font-weight: 600; color: var(--accent); border-color: var(--accent);">Save Google OAuth2 settings</button>
+  </form>
+</div>
+
 <!-- SMTP settings -->
 <div class="card">
   <h2>SMTP settings</h2>
