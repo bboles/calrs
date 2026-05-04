@@ -7484,7 +7484,7 @@ async fn user_profile(
         Some(u) => u,
         None => return Html("User not found.".to_string()),
     };
-    let lang = language.unwrap_or(crate::i18n::detect_from_headers(&headers).into());
+    let lang = crate::i18n::resolve(language.as_deref(), &headers);
 
     let event_types: Vec<(String, String, Option<String>, i32)> = sqlx::query_as(
         "SELECT et.slug, et.title, et.description, et.duration_min
