@@ -132,6 +132,33 @@ pub fn verify_csrf_token(
     }
 }
 
+/// Extract the client IP for rate-limiting from request headers.
+///
+/// Trust model: assumes calrs runs behind a single reverse proxy (the
+/// documented Caddy/Nginx setup) that appends the observed peer address
+/// to `X-Forwarded-For`. Each proxy in the chain appends, so the
+/// rightmost value is the most-recent trusted hop's view of its peer,
+/// and everything to its left is attacker-controlled. Taking the
+/// rightmost value defeats the "set X-Forwarded-For: random.ip on every
+/// request" rate-limit bypass.
+///
+/// `X-Real-IP` is intentionally not honoured: neither documented proxy
+/// sets it by default, so a client-supplied `X-Real-IP` would pass
+/// straight through and be trusted (worse than the bug this fixes).
+///
+/// Falls back to `"unknown"` if `X-Forwarded-For` is missing, which
+/// collapses such requests into a single shared rate-limit bucket. That
+/// is intentional: it throttles abuse rather than letting it through.
+pub fn client_ip_for_rate_limit(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.rsplit(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Form struct for POST endpoints that only need CSRF validation.
 #[derive(Deserialize)]
 struct CsrfForm {
@@ -7291,13 +7318,7 @@ async fn handle_group_booking(
     }
     let lang = crate::i18n::detect_from_headers(&headers);
     // Rate limit by IP
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .unwrap_or("unknown")
-        .trim()
-        .to_string();
+    let client_ip = client_ip_for_rate_limit(&headers);
     if state.booking_limiter.check_limited(&client_ip).await {
         tracing::warn!(ip = %client_ip, "rate limited");
         return Html("Too many booking attempts. Please try again in a few minutes.".to_string())
@@ -8067,13 +8088,7 @@ async fn handle_dynamic_group_booking(
 ) -> Response {
     let lang = crate::i18n::detect_from_headers(headers);
     // Rate limit by IP
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .unwrap_or("unknown")
-        .trim()
-        .to_string();
+    let client_ip = client_ip_for_rate_limit(headers);
     if state.booking_limiter.check_limited(&client_ip).await {
         tracing::warn!(ip = %client_ip, "rate limited");
         return Html("Too many booking attempts. Please try again in a few minutes.".to_string())
@@ -8758,13 +8773,7 @@ async fn handle_booking_for_user(
         return handle_dynamic_group_booking(&state, &headers, &username, &slug, &form).await;
     }
     // Rate limit by IP
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .unwrap_or("unknown")
-        .trim()
-        .to_string();
+    let client_ip = client_ip_for_rate_limit(&headers);
     if state.booking_limiter.check_limited(&client_ip).await {
         tracing::warn!(ip = %client_ip, "rate limited");
         return Html("Too many booking attempts. Please try again in a few minutes.".to_string())
@@ -10555,13 +10564,7 @@ async fn handle_booking(
     }
     let lang = crate::i18n::detect_from_headers(&headers);
     // Rate limit by IP
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .unwrap_or("unknown")
-        .trim()
-        .to_string();
+    let client_ip = client_ip_for_rate_limit(&headers);
     if state.booking_limiter.check_limited(&client_ip).await {
         tracing::warn!(ip = %client_ip, "rate limited");
         return Html("Too many booking attempts. Please try again in a few minutes.".to_string())
@@ -13056,13 +13059,7 @@ async fn guest_reschedule_booking(
     }
     let lang = crate::i18n::detect_from_headers(&headers);
     // Rate limit
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .unwrap_or("unknown")
-        .trim()
-        .to_string();
+    let client_ip = client_ip_for_rate_limit(&headers);
     if state.booking_limiter.check_limited(&client_ip).await {
         return Html("Too many requests. Please try again later.".to_string()).into_response();
     }
@@ -15797,6 +15794,53 @@ mod tests {
         );
         let form_token = Some("aaaaaaaaaaaaaaab".to_string());
         assert!(verify_csrf_token(&headers, &form_token).is_err());
+    }
+
+    // --- client_ip_for_rate_limit ---
+
+    #[test]
+    fn client_ip_unknown_when_no_headers() {
+        let headers = HeaderMap::new();
+        assert_eq!(client_ip_for_rate_limit(&headers), "unknown");
+    }
+
+    #[test]
+    fn client_ip_ignores_x_real_ip() {
+        // We deliberately do not honour X-Real-IP: in default Caddy/Nginx
+        // setups the proxy does not overwrite a client-supplied value, so
+        // trusting it would let the client forge their identity directly.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "1.2.3.4".parse().unwrap());
+        assert_eq!(client_ip_for_rate_limit(&headers), "unknown");
+    }
+
+    #[test]
+    fn client_ip_takes_rightmost_xff() {
+        // The leftmost value is whatever the original client put in the
+        // header; the rightmost is the trusted proxy's view of its peer.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "attacker-spoofed, 198.51.100.7".parse().unwrap(),
+        );
+        assert_eq!(client_ip_for_rate_limit(&headers), "198.51.100.7");
+    }
+
+    #[test]
+    fn client_ip_xff_single_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.10".parse().unwrap());
+        assert_eq!(client_ip_for_rate_limit(&headers), "203.0.113.10");
+    }
+
+    #[test]
+    fn client_ip_xff_trims_whitespace() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "1.2.3.4 ,    198.51.100.7   ".parse().unwrap(),
+        );
+        assert_eq!(client_ip_for_rate_limit(&headers), "198.51.100.7");
     }
 
     // --- fetch_busy_times_for_user_ex exclude_booking_id tests ---
