@@ -16613,7 +16613,16 @@ mod tests {
 
         let buf = Buf(Arc::new(Mutex::new(String::new())));
         let subscriber = Recorder { buf: buf.0.clone() };
-        tracing::subscriber::with_default(subscriber, f);
+        tracing::subscriber::with_default(subscriber, || {
+            // tracing caches per-callsite Interest the first time the
+            // callsite fires. If a sibling test (e.g. one that just
+            // exercises the response body without capturing logs) ran
+            // first under NoSubscriber, the cached interest is `never` and
+            // our scoped Recorder never sees the event. Force a rebuild
+            // against the now-active subscriber before invoking f.
+            tracing::callsite::rebuild_interest_cache();
+            f();
+        });
         let s = buf.0.lock().unwrap().clone();
         s
     }
