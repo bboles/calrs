@@ -223,9 +223,14 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: SourceCommands) -> Resu
             let client_id = client_id
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("Google OAuth2 not configured. Set credentials via `calrs config` or the admin panel."))?;
-            let client_secret = client_secret
+            let client_secret_enc = client_secret
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("Google OAuth2 client secret not configured."))?;
+            // Stored client_secret is encrypted at rest (see crypto::encrypt_value).
+            let client_secret =
+                crate::crypto::decrypt_value(key, &client_secret_enc).map_err(|e| {
+                    anyhow::anyhow!("Google OAuth2 client secret decryption failed: {}", e)
+                })?;
 
             let name = name.unwrap_or_else(|| prompt("Display name"));
 

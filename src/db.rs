@@ -723,6 +723,32 @@ pub async fn migrate_passwords(pool: &SqlitePool, key: &[u8; 32]) -> Result<()> 
         }
     }
 
+    // Migrate auth_config.google_oauth2_client_secret. Same shape as the
+    // OIDC migration above: pre-existing rows hold raw plaintext, and the
+    // sentinel-prefix-plus-try-decrypt check makes the migration
+    // idempotent and robust against the pathological "plaintext that
+    // happens to start with enc:v1:" case.
+    let google_row: Option<(String,)> = sqlx::query_as(
+        "SELECT google_oauth2_client_secret FROM auth_config WHERE id = 'singleton' AND google_oauth2_client_secret IS NOT NULL",
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some((stored,)) = google_row {
+        let already_encrypted = crate::crypto::is_encrypted_value(&stored)
+            && crate::crypto::decrypt_value(key, &stored).is_ok();
+        if !stored.is_empty() && !already_encrypted {
+            let encrypted = crate::crypto::encrypt_value(key, &stored)?;
+            sqlx::query(
+                "UPDATE auth_config SET google_oauth2_client_secret = ? WHERE id = 'singleton'",
+            )
+            .bind(&encrypted)
+            .execute(pool)
+            .await?;
+            migrated += 1;
+        }
+    }
+
     if migrated > 0 {
         println!(
             "{} Migrated {} credential(s) to encrypted storage.",
@@ -1043,6 +1069,113 @@ mod tests {
         // The stored value is unchanged on the second run (we don't
         // re-encrypt, which would otherwise produce a different
         // ciphertext from the random nonce).
+        assert_eq!(after_first.0, after_second.0);
+        assert_eq!(
+            crate::crypto::decrypt_value(&key, &after_second.0).unwrap(),
+            plaintext,
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_passwords_encrypts_plaintext_google_oauth2_secret() {
+        // Pre-existing plaintext Google OAuth2 client secret should be
+        // transparently re-encrypted on the next startup, matching the
+        // OIDC client secret migration.
+        let pool = memory_pool().await;
+        migrate(&pool).await.unwrap();
+        let key = [13u8; 32];
+        let plaintext = "GOCSPX-my-google-client-secret";
+
+        sqlx::query(
+            "UPDATE auth_config SET google_oauth2_client_secret = ? WHERE id = 'singleton'",
+        )
+        .bind(plaintext)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate_passwords(&pool, &key).await.unwrap();
+
+        let stored: (String,) = sqlx::query_as(
+            "SELECT google_oauth2_client_secret FROM auth_config WHERE id = 'singleton'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            crate::crypto::is_encrypted_value(&stored.0),
+            "google_oauth2_client_secret should be in enc:v1: format after migration, got {:?}",
+            stored.0
+        );
+        assert_eq!(
+            crate::crypto::decrypt_value(&key, &stored.0).unwrap(),
+            plaintext,
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_passwords_handles_plaintext_google_secret_starting_with_prefix() {
+        // Pathological case: a plaintext Google client secret that
+        // literally begins with the "enc:v1:" sentinel. Try-decrypt
+        // belt-and-suspenders means the migration treats it as plaintext.
+        let pool = memory_pool().await;
+        migrate(&pool).await.unwrap();
+        let key = [17u8; 32];
+        let plaintext = "enc:v1:looks-encrypted-but-isnt";
+
+        sqlx::query(
+            "UPDATE auth_config SET google_oauth2_client_secret = ? WHERE id = 'singleton'",
+        )
+        .bind(plaintext)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate_passwords(&pool, &key).await.unwrap();
+
+        let stored: (String,) = sqlx::query_as(
+            "SELECT google_oauth2_client_secret FROM auth_config WHERE id = 'singleton'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::crypto::decrypt_value(&key, &stored.0).unwrap(),
+            plaintext,
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_passwords_is_idempotent_for_google_oauth2_secret() {
+        let pool = memory_pool().await;
+        migrate(&pool).await.unwrap();
+        let key = [19u8; 32];
+        let plaintext = "another-google-secret";
+
+        sqlx::query(
+            "UPDATE auth_config SET google_oauth2_client_secret = ? WHERE id = 'singleton'",
+        )
+        .bind(plaintext)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate_passwords(&pool, &key).await.unwrap();
+        let after_first: (String,) = sqlx::query_as(
+            "SELECT google_oauth2_client_secret FROM auth_config WHERE id = 'singleton'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        migrate_passwords(&pool, &key).await.unwrap();
+        let after_second: (String,) = sqlx::query_as(
+            "SELECT google_oauth2_client_secret FROM auth_config WHERE id = 'singleton'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
         assert_eq!(after_first.0, after_second.0);
         assert_eq!(
             crate::crypto::decrypt_value(&key, &after_second.0).unwrap(),

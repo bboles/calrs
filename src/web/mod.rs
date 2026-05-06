@@ -12436,11 +12436,16 @@ async fn admin_update_google_oauth2(
 
     if secret_provided {
         let client_secret = form.google_oauth2_client_secret.unwrap_or_default();
+        let encrypted_secret = match crate::crypto::encrypt_value(&state.secret_key, &client_secret)
+        {
+            Ok(s) => s,
+            Err(e) => return internal_error_response("encrypt google_oauth2 client_secret", &e),
+        };
         let _ = sqlx::query(
             "UPDATE auth_config SET google_oauth2_client_id = ?, google_oauth2_client_secret = ?, updated_at = datetime('now') WHERE id = 'singleton'",
         )
         .bind(&client_id)
-        .bind(&client_secret)
+        .bind(&encrypted_secret)
         .execute(&state.pool)
         .await;
     } else {
@@ -12549,9 +12554,17 @@ async fn google_callback(
     .await
     .unwrap_or(None);
 
-    let (client_id, client_secret) = match creds {
+    let (client_id, client_secret_enc) = match creds {
         Some(c) => c,
         None => return Html("Google OAuth2 not configured.".to_string()).into_response(),
+    };
+
+    // The stored Google OAuth2 client secret is encrypted at rest; the
+    // startup migration ensures any pre-existing plaintext is upgraded
+    // before we reach this path.
+    let client_secret = match crate::crypto::decrypt_value(&state.secret_key, &client_secret_enc) {
+        Ok(s) => s,
+        Err(e) => return internal_error_response("decrypt google_oauth2 client_secret", &e),
     };
 
     let base_url = std::env::var("CALRS_BASE_URL").unwrap_or_default();

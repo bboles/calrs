@@ -90,13 +90,16 @@ pub async fn refresh_access_token(
 
     let refresh_token = crate::crypto::decrypt_password(key, &refresh_token_enc)?;
 
-    // Load admin-configured Google OAuth2 credentials
+    // Load admin-configured Google OAuth2 credentials. The client_secret is
+    // encrypted at rest (see crypto::encrypt_value); decrypt before use.
     let creds: (String, String) = sqlx::query_as(
         "SELECT google_oauth2_client_id, google_oauth2_client_secret FROM auth_config LIMIT 1",
     )
     .fetch_one(pool)
     .await?;
-    let (client_id, client_secret) = creds;
+    let (client_id, client_secret_enc) = creds;
+    let client_secret = crate::crypto::decrypt_value(key, &client_secret_enc)
+        .map_err(|e| anyhow::anyhow!("Google OAuth2 client secret decryption failed: {}", e))?;
 
     // Exchange refresh token for new access token
     let client = reqwest::Client::new();
