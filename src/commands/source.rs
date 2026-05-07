@@ -5,7 +5,8 @@ use sqlx::SqlitePool;
 use tabled::{Table, Tabled};
 use uuid::Uuid;
 
-use std::io::{self, Read as _, Write};
+use std::io::{self, Write};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::utils::prompt;
 
@@ -235,7 +236,7 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: SourceCommands) -> Resu
             let name = name.unwrap_or_else(|| prompt("Display name"));
 
             // Bind a temporary TCP listener on a random port for the OAuth2 callback
-            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let port = listener.local_addr()?.port();
             let redirect_uri = format!("http://localhost:{port}/callback");
 
@@ -254,9 +255,9 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: SourceCommands) -> Resu
             println!("{} Waiting for authorization…", "…".dimmed());
 
             // Accept one connection and read the HTTP request
-            let (mut stream, _) = listener.accept()?;
+            let (mut stream, _) = listener.accept().await?;
             let mut buf = [0u8; 4096];
-            let n = stream.read(&mut buf)?;
+            let n = stream.read(&mut buf).await?;
             let request = String::from_utf8_lossy(&buf[..n]);
 
             // Parse the GET request line to extract query parameters
@@ -273,7 +274,7 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: SourceCommands) -> Resu
                 response_body.len(),
                 response_body
             );
-            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            let _ = stream.write_all(response.as_bytes()).await;
             drop(stream);
 
             // Extract code and state from query string
