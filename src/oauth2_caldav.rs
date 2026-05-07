@@ -61,7 +61,7 @@ pub async fn exchange_google_code(
     let token: TokenResponse = resp.json().await?;
     let refresh_token = token
         .refresh_token
-        .ok_or_else(|| anyhow::anyhow!("No refresh token received — ensure prompt=consent"))?;
+        .ok_or_else(|| anyhow::anyhow!("No refresh token received. Ensure prompt=consent"))?;
     let expires_in = token.expires_in.unwrap_or(3600);
 
     Ok((token.access_token, refresh_token, expires_in))
@@ -211,7 +211,7 @@ pub fn google_caldav_base_url() -> &'static str {
 }
 
 /// Build the per-user Google CalDAV principal URL.
-/// Google requires PROPFIND to target `/caldav/v2/{userEmail}/user` — the bare
+/// Google requires PROPFIND to target `/caldav/v2/{userEmail}/user`. The bare
 /// `/caldav/v2/` returns 403 for principal discovery.
 pub fn google_caldav_url_for_email(email: &str) -> String {
     format!("{}{}/user", GOOGLE_CALDAV_BASE, urlencoding::encode(email))

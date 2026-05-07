@@ -13,8 +13,8 @@ use crate::utils::{extract_vevent_field, extract_vevent_tzid, split_vevents};
 /// Default staleness threshold: 5 minutes
 const STALE_SECS: i64 = 300;
 
-/// Look-back window for full-fetch path. Bounded so Google CalDAV — which
-/// truncates the forward window of unfiltered REPORTs — returns future events
+/// Look-back window for full-fetch path. Bounded so Google CalDAV, which
+/// truncates the forward window of unfiltered REPORTs, returns future events
 /// via the `time-range` filter. 90 days keeps recent history available for
 /// orphan/cancellation detection without ballooning the response.
 const FULL_FETCH_LOOKBACK_DAYS: i64 = 90;
@@ -198,7 +198,7 @@ pub async fn sync_source(
                     let count = upsert_raw_events(pool, &cal_id, &raw_events).await;
 
                     // Remove events that no longer exist on the server, but only
-                    // within the fetched window — older events weren't in the
+                    // within the fetched window. Older events weren't in the
                     // response by design and must not be treated as orphans.
                     let deleted =
                         remove_orphaned_events(pool, key, &cal_id, &raw_events, &since_prefix)
@@ -542,7 +542,7 @@ async fn delete_events_by_href(
 
 /// Remove local events that no longer exist on the server (full sync orphan cleanup).
 /// `since_prefix` bounds the orphan check to events whose start_at falls inside
-/// the fetched window — older events weren't in the response and must not be
+/// the fetched window. Older events weren't in the response and must not be
 /// deleted as orphans. Pass an empty string to consider all local events.
 async fn remove_orphaned_events(
     pool: &SqlitePool,

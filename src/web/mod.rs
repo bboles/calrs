@@ -12593,7 +12593,7 @@ async fn google_callback(
             Err(e) => return Html(format!("Token exchange failed: {}", e)).into_response(),
         };
 
-    // Identify the Google account that authorized us — its email is what goes in the CalDAV URL.
+    // Identify the Google account that authorized us; its email is what goes in the CalDAV URL.
     // The local calrs user's email is unrelated and may not match the Google account.
     let google_email = match crate::oauth2_caldav::fetch_google_email(&access_token).await {
         Ok(e) => e,
@@ -14608,7 +14608,7 @@ async fn caldav_push_booking(
 
     if sources.is_empty() {
         // Distinguish "user has no sources" (debug) from "user has sources but none
-        // are write-configured" (warn) — the second case is almost always a misconfig.
+        // are write-configured" (warn). The second case is almost always a misconfig.
         let unconfigured: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM caldav_sources cs
              JOIN accounts a ON a.id = cs.account_id
@@ -14624,7 +14624,7 @@ async fn caldav_push_booking(
                 user_id = %user_id,
                 uid = %booking_uid,
                 unconfigured_sources = unconfigured,
-                "CalDAV write-back skipped: booking confirmed but no source has a write calendar selected — pick one at /dashboard/sources",
+                "CalDAV write-back skipped: booking confirmed but no source has a write calendar selected. Pick one at /dashboard/sources",
             );
         } else {
             tracing::debug!(user_id = %user_id, "CalDAV write-back skipped: no enabled CalDAV sources for user");

@@ -249,7 +249,7 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: SourceCommands) -> Resu
 
             // Try to open browser automatically
             if open::that(&auth_url).is_err() {
-                println!("(Could not open browser automatically — please copy the URL above.)");
+                println!("(Could not open browser automatically. Please copy the URL above.)");
             }
 
             println!("{} Waiting for authorization…", "…".dimmed());
@@ -293,7 +293,7 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: SourceCommands) -> Resu
 
             let callback_state = params.get("state").unwrap_or(&"");
             if *callback_state != state {
-                bail!("CSRF state mismatch — possible security issue. Please try again.");
+                bail!("CSRF state mismatch, possible security issue. Please try again.");
             }
 
             let code = params
@@ -313,7 +313,7 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: SourceCommands) -> Resu
                 .await?;
             println!("{}", "OK".green());
 
-            // Fetch the Google account email — it identifies the principal in the CalDAV URL.
+            // Fetch the Google account email; it identifies the principal in the CalDAV URL.
             let username = crate::oauth2_caldav::fetch_google_email(&access_token).await?;
             let caldav_url = crate::oauth2_caldav::google_caldav_url_for_email(&username);
 

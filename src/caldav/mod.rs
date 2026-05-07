@@ -181,11 +181,11 @@ impl CaldavClient {
         tracing::debug!(url = %url, status = %status, "PROPFIND response received");
 
         if !status.is_success() && status.as_u16() != 207 {
-            // Surface the response body — servers like Google embed the actual reason
+            // Surface the response body. Servers like Google embed the actual reason
             // (insufficient scope, API not enabled, etc.) in the body, not the status line.
             let body = resp.text().await.unwrap_or_default();
             let snippet: String = body.chars().take(500).collect();
-            bail!("PROPFIND {} returned {} — {}", url, status, snippet);
+            bail!("PROPFIND {} returned {}: {}", url, status, snippet);
         }
 
         Ok(resp.text().await?)
@@ -236,7 +236,7 @@ impl CaldavClient {
     /// Discover the current-user-principal URL via PROPFIND
     pub async fn discover_principal(&self) -> Result<String> {
         // Google CalDAV doesn't return <current-user-principal> in a way the
-        // standard discovery flow can use — but the URL we configure for Google
+        // standard discovery flow can use, but the URL we configure for Google
         // OAuth2 sources is already the per-user principal endpoint, so skip the
         // round-trip and return it directly.
         if self.base_url.contains(GOOGLE_CALDAV_HOST) {
