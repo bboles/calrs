@@ -134,6 +134,18 @@ pub async fn refresh_access_token(
     .execute(pool)
     .await?;
 
+    // Google may rotate the refresh token on a refresh response. Persist it so
+    // the next refresh doesn't fail with the now-invalid stored token.
+    if let Some(new_refresh) = token.refresh_token {
+        let refresh_enc = crate::crypto::encrypt_password(key, &new_refresh)?;
+        sqlx::query("UPDATE caldav_sources SET refresh_token_enc = ? WHERE id = ?")
+            .bind(&refresh_enc)
+            .bind(source_id)
+            .execute(pool)
+            .await?;
+        tracing::info!(source_id = %source_id, "rotated OAuth2 refresh token");
+    }
+
     tracing::info!(source_id = %source_id, "refreshed OAuth2 access token");
     Ok(token.access_token)
 }
