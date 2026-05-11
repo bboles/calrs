@@ -353,7 +353,7 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: SourceCommands) -> Resu
             .bind(&name)
             .bind(&caldav_url)
             .bind(&username)
-            .bind("")  // password_enc NOT NULL, empty for OAuth2
+            .bind(None::<String>)
             .bind(&access_token_enc)
             .bind(&refresh_token_enc)
             .bind(&expires_at)
