@@ -1,5 +1,5 @@
 -- OAuth2 authentication support for CalDAV sources (e.g. Google Calendar)
-ALTER TABLE caldav_sources ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'basic';
+ALTER TABLE caldav_sources ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'basic' CHECK (auth_type IN ('basic', 'oauth2'));
 ALTER TABLE caldav_sources ADD COLUMN oauth2_provider TEXT;
 ALTER TABLE caldav_sources ADD COLUMN access_token_enc TEXT;
 ALTER TABLE caldav_sources ADD COLUMN refresh_token_enc TEXT;
