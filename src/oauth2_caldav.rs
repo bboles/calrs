@@ -32,6 +32,22 @@ pub fn build_google_auth_url(client_id: &str, redirect_uri: &str, state: &str) -
     )
 }
 
+/// POST form-encoded params to Google's OAuth2 token endpoint and parse the response.
+async fn post_to_google_token(op: &str, form: &[(&str, &str)]) -> Result<TokenResponse> {
+    let resp = reqwest::Client::new()
+        .post(GOOGLE_TOKEN_URL)
+        .form(form)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("Google token {} failed: {}", op, body);
+    }
+
+    Ok(resp.json().await?)
+}
+
 /// Exchange an authorization code for access + refresh tokens.
 /// Returns (access_token, refresh_token, expires_in_seconds).
 pub async fn exchange_google_code(
@@ -40,25 +56,18 @@ pub async fn exchange_google_code(
     code: &str,
     redirect_uri: &str,
 ) -> Result<(String, String, i64)> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(GOOGLE_TOKEN_URL)
-        .form(&[
+    let token = post_to_google_token(
+        "exchange",
+        &[
             ("client_id", client_id),
             ("client_secret", client_secret),
             ("code", code),
             ("redirect_uri", redirect_uri),
             ("grant_type", "authorization_code"),
-        ])
-        .send()
-        .await?;
+        ],
+    )
+    .await?;
 
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("Google token exchange failed: {}", body);
-    }
-
-    let token: TokenResponse = resp.json().await?;
     let refresh_token = token
         .refresh_token
         .ok_or_else(|| anyhow::anyhow!("No refresh token received. Ensure prompt=consent"))?;
@@ -101,25 +110,16 @@ pub async fn refresh_access_token(
     let client_secret = crate::crypto::decrypt_value(key, &client_secret_enc)
         .map_err(|e| anyhow::anyhow!("Google OAuth2 client secret decryption failed: {}", e))?;
 
-    // Exchange refresh token for new access token
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(GOOGLE_TOKEN_URL)
-        .form(&[
+    let token = post_to_google_token(
+        "refresh",
+        &[
             ("client_id", &client_id),
             ("client_secret", &client_secret),
             ("refresh_token", &refresh_token),
-            ("grant_type", &"refresh_token".to_string()),
-        ])
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("Google token refresh failed: {}", body);
-    }
-
-    let token: TokenResponse = resp.json().await?;
+            ("grant_type", "refresh_token"),
+        ],
+    )
+    .await?;
     let expires_in = token.expires_in.unwrap_or(3600);
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(expires_in);
 
