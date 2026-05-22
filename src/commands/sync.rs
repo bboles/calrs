@@ -142,8 +142,15 @@ pub async fn sync_source(
                         false
                     } else {
                         let changed = upsert_raw_events(pool, &cal_id, &result.changed).await;
-                        let deleted =
-                            delete_events_by_href(pool, key, &cal_id, &result.deleted_hrefs).await;
+                        let deleted = delete_events_by_href(
+                            pool,
+                            key,
+                            Some(client),
+                            source_id,
+                            &cal_id,
+                            &result.deleted_hrefs,
+                        )
+                        .await;
 
                         // Store new sync-token and ctag
                         update_calendar_sync_state(
@@ -200,9 +207,16 @@ pub async fn sync_source(
                     // Remove events that no longer exist on the server, but only
                     // within the fetched window. Older events weren't in the
                     // response by design and must not be treated as orphans.
-                    let deleted =
-                        remove_orphaned_events(pool, key, &cal_id, &raw_events, &since_prefix)
-                            .await;
+                    let deleted = remove_orphaned_events(
+                        pool,
+                        key,
+                        Some(client),
+                        source_id,
+                        &cal_id,
+                        &raw_events,
+                        &since_prefix,
+                    )
+                    .await;
                     if deleted > 0 {
                         tracing::info!(
                             calendar_name = cal_label,
@@ -246,7 +260,7 @@ pub async fn sync_source(
     // Cancel any active bookings whose CalDAV event no longer exists.
     // This catches bookings orphaned before the cancellation code was deployed,
     // or edge cases where the event was deleted in a previous sync cycle.
-    cancel_orphaned_bookings(pool, key, source_id).await;
+    cancel_orphaned_bookings(pool, key, Some(client), source_id).await;
 
     // Update last_synced (and last_full_sync if we did a full fetch)
     if did_full_sync {
@@ -510,9 +524,17 @@ async fn upsert_raw_events(pool: &SqlitePool, cal_id: &str, raw_events: &[RawEve
 /// Delete events by their CalDAV href (used for sync-collection 404 deletions).
 /// Extracts UID from href pattern: /path/to/{uid}.ics
 /// Also cancels any calrs bookings whose UID matches a deleted event and notifies the guest.
+///
+/// `client` is forwarded to `cancel_orphaned_booking` for confirm-before-cancel
+/// verification. Tests pass `None` to bypass HTTP verification.
+///
+/// `source_id` scopes booking cancellations to event types owned by this source's
+/// account (issue #106 defense-in-depth).
 async fn delete_events_by_href(
     pool: &SqlitePool,
     key: &[u8; 32],
+    client: Option<&CaldavClient>,
+    source_id: &str,
     cal_id: &str,
     hrefs: &[String],
 ) -> u32 {
@@ -524,29 +546,54 @@ async fn delete_events_by_href(
             .next()
             .unwrap_or("")
             .trim_end_matches(".ics");
-        if !uid.is_empty() {
-            let result = sqlx::query("DELETE FROM events WHERE calendar_id = ? AND uid = ?")
-                .bind(cal_id)
-                .bind(uid)
-                .execute(pool)
-                .await;
-            if let Ok(r) = result {
-                deleted += r.rows_affected() as u32;
-            }
-            // Cancel any matching booking that was deleted on the CalDAV server
-            cancel_orphaned_booking(pool, key, uid).await;
+        if uid.is_empty() {
+            continue;
+        }
+        let rows = sqlx::query("DELETE FROM events WHERE calendar_id = ? AND uid = ?")
+            .bind(cal_id)
+            .bind(uid)
+            .execute(pool)
+            .await
+            .map(|r| r.rows_affected())
+            .unwrap_or(0);
+        if rows > 0 {
+            deleted += rows as u32;
+            // Cancel any matching booking that was deleted on the CalDAV server.
+            // Gated on rows_affected > 0: if the server reports an href as deleted
+            // but we never had a matching local event, that's a server-side quirk
+            // (e.g. BlueMind sync-collection emitting spurious 404 propstats) — not
+            // proof the host deleted the event. Cancelling on that signal alone has
+            // wrongly cancelled live bookings in production.
+            cancel_orphaned_booking(pool, key, client, source_id, uid).await;
+        } else {
+            tracing::warn!(
+                uid = %uid,
+                href = %href,
+                calendar_id = %cal_id,
+                "sync-collection reported href as deleted but no matching local event; \
+                 skipping booking cancellation (likely server-side false positive)"
+            );
         }
     }
     deleted
 }
 
 /// Remove local events that no longer exist on the server (full sync orphan cleanup).
+///
+/// `client` is forwarded to `cancel_orphaned_booking` for confirm-before-cancel
+/// verification. Tests pass `None` to bypass HTTP verification.
+///
+/// `source_id` scopes booking cancellations to event types owned by this source's
+/// account (issue #106 defense-in-depth).
+///
 /// `since_prefix` bounds the orphan check to events whose start_at falls inside
 /// the fetched window. Older events weren't in the response and must not be
 /// deleted as orphans. Pass an empty string to consider all local events.
 async fn remove_orphaned_events(
     pool: &SqlitePool,
     key: &[u8; 32],
+    client: Option<&CaldavClient>,
+    source_id: &str,
     cal_id: &str,
     raw_events: &[RawEvent],
     since_prefix: &str,
@@ -599,7 +646,7 @@ async fn remove_orphaned_events(
                 .bind(event_id)
                 .execute(pool)
                 .await;
-            cancel_orphaned_booking(pool, key, uid).await;
+            cancel_orphaned_booking(pool, key, client, source_id, uid).await;
             deleted += 1;
         }
     }
@@ -611,8 +658,31 @@ async fn remove_orphaned_events(
 /// Pending bookings are intentionally excluded: they haven't been pushed to CalDAV yet,
 /// so "missing from server" is the normal state, not a cancellation signal.
 /// Sends cancellation email to the guest (and host) if SMTP is configured.
-async fn cancel_orphaned_booking(pool: &SqlitePool, key: &[u8; 32], uid: &str) {
-    // Fetch booking details before cancelling
+///
+/// `source_id` scopes the lookup: only bookings on event types whose account owns
+/// `source_id` are eligible for cancellation. This is defense-in-depth — a sync
+/// of source A must never be able to cancel a booking on source B (different
+/// account, same UID by collision). See issue #106.
+///
+/// When `client` is `Some` and the booking has a stored `caldav_calendar_href`,
+/// the resource is double-checked against the server via HEAD/PROPFIND before
+/// the cancellation goes through. If the server says the event is still there
+/// (or the verification can't conclude — network error, 5xx, auth failure),
+/// the cancellation is skipped and a warning is logged. This is the safety net
+/// against false positives in any orphan path: see issue #105.
+///
+/// Tests pass `None` for `client` to skip the HTTP verification and exercise the
+/// DB-only cancellation behaviour directly.
+async fn cancel_orphaned_booking(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    client: Option<&CaldavClient>,
+    source_id: &str,
+    uid: &str,
+) {
+    // Fetch booking details before cancelling. Scoped by source_id via the
+    // caldav_sources join: the source's account must match the booking's
+    // event-type account.
     let booking: Option<(
         String,
         String,
@@ -624,16 +694,19 @@ async fn cancel_orphaned_booking(pool: &SqlitePool, key: &[u8; 32], uid: &str) {
         String,
         String,
         String,
+        Option<String>,
     )> = sqlx::query_as(
         "SELECT b.id, b.guest_name, b.guest_email, COALESCE(b.guest_timezone, 'UTC'), b.start_at, b.end_at, b.uid,
-                et.title, u.name, COALESCE(u.booking_email, u.email)
+                et.title, u.name, COALESCE(u.booking_email, u.email), b.caldav_calendar_href
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
          JOIN users u ON u.id = a.user_id
-         WHERE b.uid = ? AND b.status = 'confirmed'",
+         JOIN caldav_sources cs ON cs.account_id = a.id
+         WHERE b.uid = ? AND b.status = 'confirmed' AND cs.id = ?",
     )
     .bind(uid)
+    .bind(source_id)
     .fetch_optional(pool)
     .await
     .unwrap_or(None);
@@ -654,7 +727,41 @@ async fn cancel_orphaned_booking(pool: &SqlitePool, key: &[u8; 32], uid: &str) {
         event_title,
         host_name,
         host_email,
+        caldav_calendar_href,
     ) = booking;
+
+    // Confirm-before-cancel: if we have a client and a stored calendar href for
+    // this booking, verify that the resource is actually 404 on the server.
+    // Any non-404 outcome (200 = still there, 5xx = server flake, network = down)
+    // means we cannot prove the host deleted the event, so we skip the cancel.
+    if let (Some(client), Some(cal_href)) = (client, caldav_calendar_href.as_deref()) {
+        match client.event_exists(cal_href, uid).await {
+            Ok(false) => {
+                // Server confirms 404 — legitimate deletion, proceed.
+            }
+            Ok(true) => {
+                tracing::warn!(
+                    uid = %uid,
+                    booking_id = %booking_id,
+                    cal_href = %cal_href,
+                    "skipping booking cancellation: CalDAV resource is still present on the server \
+                     (a sync path reported it as deleted but verification disagrees)"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    uid = %uid,
+                    booking_id = %booking_id,
+                    cal_href = %cal_href,
+                    error = %e,
+                    "skipping booking cancellation: could not verify resource state on the server \
+                     (treating inconclusive verification as not-deleted to avoid false positives)"
+                );
+                return;
+            }
+        }
+    }
 
     // Cancel the booking
     let updated = sqlx::query(
@@ -725,7 +832,12 @@ fn extract_time(dt_str: &str) -> String {
 /// not be auto-cancelled by sync — a guest-initiated reschedule that requires approval
 /// deletes the prior CalDAV event on purpose, and the orphan sweep would otherwise race
 /// the approval flow and cancel the booking before the host clicks approve.
-async fn cancel_orphaned_bookings(pool: &SqlitePool, key: &[u8; 32], source_id: &str) {
+async fn cancel_orphaned_bookings(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    client: Option<&CaldavClient>,
+    source_id: &str,
+) {
     let orphans: Vec<(String,)> = sqlx::query_as(
         "SELECT b.uid FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
@@ -742,7 +854,7 @@ async fn cancel_orphaned_bookings(pool: &SqlitePool, key: &[u8; 32], source_id: 
     .unwrap_or_default();
 
     for (uid,) in &orphans {
-        cancel_orphaned_booking(pool, key, uid).await;
+        cancel_orphaned_booking(pool, key, client, source_id, uid).await;
     }
 }
 
@@ -831,7 +943,7 @@ mod tests {
         .unwrap();
         // Note: no matching row in `events` — the CalDAV event was deleted during reschedule.
 
-        cancel_orphaned_bookings(&pool, &key, &source_id).await;
+        cancel_orphaned_bookings(&pool, &key, None, &source_id).await;
 
         let status: String = sqlx::query_scalar("SELECT status FROM bookings WHERE id = ?")
             .bind(&booking_id)
@@ -842,6 +954,206 @@ mod tests {
             status, "pending",
             "pending bookings must not be auto-cancelled by the orphan sweep — \
              they're awaiting host approval, not tracking a CalDAV event"
+        );
+    }
+
+    /// Regression test for production incident 2026-05-14: a sync-collection delta
+    /// reported an href as deleted, but the local `events` table had no matching row
+    /// (the event lived on a different calendar — the booking's write calendar).
+    /// Before the fix, `delete_events_by_href` still called `cancel_orphaned_booking`,
+    /// which scans bookings globally by UID and wrongly cancelled a live booking.
+    /// The fix gates the cancellation on the local DELETE having matched a row.
+    #[tokio::test]
+    async fn delete_events_by_href_skips_cancellation_when_no_local_event() {
+        let pool = setup_test_db().await;
+        let (source_id, et_id) = seed_fixtures(&pool).await;
+        let key = [0u8; 32];
+
+        // Seed a calendar on this source (the one that supposedly reported a
+        // deletion via sync-collection delta).
+        let cal_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO calendars (id, source_id, href, display_name) \
+             VALUES (?, ?, '/calendars/host/shared/', 'Shared')",
+        )
+        .bind(&cal_id)
+        .bind(&source_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The confirmed booking. Note: NO matching row in `events` for this calendar
+        // — the booking's CalDAV event lives elsewhere (or was never synced into
+        // this particular calendar).
+        let booking_uid = "live-booking-uid@calrs";
+        let booking_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone,
+                start_at, end_at, status, cancel_token, reschedule_token, caldav_calendar_href)
+             VALUES (?, ?, ?, 'Guest', 'guest@example.com', 'UTC',
+                '2030-06-15T10:00:00', '2030-06-15T10:30:00', 'confirmed', 'ctok', 'rtok',
+                '/calendars/host/default/')",
+        )
+        .bind(&booking_id)
+        .bind(&et_id)
+        .bind(booking_uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Simulate BlueMind's sync-collection reporting this href as deleted on
+        // the Shared calendar (false positive — the event isn't there locally).
+        let href = format!("/calendars/host/shared/{}.ics", booking_uid);
+        let deleted = delete_events_by_href(&pool, &key, None, &source_id, &cal_id, &[href]).await;
+        assert_eq!(deleted, 0, "no local row to delete");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM bookings WHERE id = ?")
+            .bind(&booking_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "confirmed",
+            "a sync-collection 'deleted' href with no local event MUST NOT cancel the booking"
+        );
+    }
+
+    /// Positive case for `delete_events_by_href`: when the server reports a deletion
+    /// AND we had a matching local event for that calendar, we both remove the event
+    /// and cancel any booking with that UID. This is the legitimate signal.
+    #[tokio::test]
+    async fn delete_events_by_href_cancels_when_local_event_existed() {
+        let pool = setup_test_db().await;
+        let (source_id, et_id) = seed_fixtures(&pool).await;
+        let key = [0u8; 32];
+
+        let cal_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO calendars (id, source_id, href, display_name) \
+             VALUES (?, ?, '/calendars/host/default/', 'Default')",
+        )
+        .bind(&cal_id)
+        .bind(&source_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let booking_uid = "to-be-cancelled@calrs";
+
+        // Seed the local event row (we knew about it before the server signaled deletion).
+        sqlx::query(
+            "INSERT INTO events (id, calendar_id, uid, summary, start_at, end_at) \
+             VALUES (?, ?, ?, 'Demo', '2030-06-15T10:00:00', '2030-06-15T10:30:00')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&cal_id)
+        .bind(booking_uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let booking_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone,
+                start_at, end_at, status, cancel_token, reschedule_token, caldav_calendar_href)
+             VALUES (?, ?, ?, 'Guest', 'guest@example.com', 'UTC',
+                '2030-06-15T10:00:00', '2030-06-15T10:30:00', 'confirmed', 'ctok', 'rtok',
+                '/calendars/host/default/')",
+        )
+        .bind(&booking_id)
+        .bind(&et_id)
+        .bind(booking_uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let href = format!("/calendars/host/default/{}.ics", booking_uid);
+        let deleted = delete_events_by_href(&pool, &key, None, &source_id, &cal_id, &[href]).await;
+        assert_eq!(deleted, 1, "local row should have been removed");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM bookings WHERE id = ?")
+            .bind(&booking_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "cancelled");
+    }
+
+    /// Confirm-before-cancel (issue #105): when the verification HTTP call can't
+    /// reach the server (unreachable host, timeout, 5xx), `cancel_orphaned_booking`
+    /// must treat the result as inconclusive and SKIP the cancellation. The
+    /// principle is "never cancel a customer booking unless the server confirms
+    /// the event is gone." A flaky network minute is no basis for cancelling.
+    ///
+    /// This test points the CaldavClient at a closed port so the HEAD fails with
+    /// a connection error; we set up a delta-path scenario where the booking
+    /// would otherwise be cancelled (local event present, server reports deletion).
+    #[tokio::test]
+    async fn delete_events_by_href_skips_cancellation_when_verification_fails() {
+        let pool = setup_test_db().await;
+        let (source_id, et_id) = seed_fixtures(&pool).await;
+        let key = [0u8; 32];
+
+        let cal_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO calendars (id, source_id, href, display_name) \
+             VALUES (?, ?, '/calendars/host/default/', 'Default')",
+        )
+        .bind(&cal_id)
+        .bind(&source_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let booking_uid = "ambiguous-deletion@calrs";
+
+        // Local event row exists — so the DELETE will report rows_affected > 0
+        // and the hotfix gate alone wouldn't save us. Only the verification
+        // layer should keep this booking confirmed.
+        sqlx::query(
+            "INSERT INTO events (id, calendar_id, uid, summary, start_at, end_at) \
+             VALUES (?, ?, ?, 'Demo', '2030-06-15T10:00:00', '2030-06-15T10:30:00')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&cal_id)
+        .bind(booking_uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let booking_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone,
+                start_at, end_at, status, cancel_token, reschedule_token, caldav_calendar_href)
+             VALUES (?, ?, ?, 'Guest', 'guest@example.com', 'UTC',
+                '2030-06-15T10:00:00', '2030-06-15T10:30:00', 'confirmed', 'ctok', 'rtok',
+                '/calendars/host/default/')",
+        )
+        .bind(&booking_id)
+        .bind(&et_id)
+        .bind(booking_uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Port 1 is reserved (tcpmux) and ~always closed on a dev box — HEAD will
+        // fail with a connection refusal, exercising the Err(_) arm of the
+        // verification gate.
+        let client = CaldavClient::new("http://127.0.0.1:1", "u", "p");
+
+        let href = format!("/calendars/host/default/{}.ics", booking_uid);
+        let _ =
+            delete_events_by_href(&pool, &key, Some(&client), &source_id, &cal_id, &[href]).await;
+
+        let status: String = sqlx::query_scalar("SELECT status FROM bookings WHERE id = ?")
+            .bind(&booking_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "confirmed",
+            "verification HTTP failure must NOT cancel the booking — \
+             inconclusive evidence cannot justify a customer-visible cancellation"
         );
     }
 
@@ -868,7 +1180,7 @@ mod tests {
         .await
         .unwrap();
 
-        cancel_orphaned_bookings(&pool, &key, &source_id).await;
+        cancel_orphaned_bookings(&pool, &key, None, &source_id).await;
 
         let status: String = sqlx::query_scalar("SELECT status FROM bookings WHERE id = ?")
             .bind(&booking_id)
@@ -876,6 +1188,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "cancelled");
+    }
+
+    /// Issue #106 (cross-source isolation defense-in-depth): a sync of source A
+    /// must NEVER cancel a booking that belongs to source B's account, even if
+    /// the UIDs collide. UUIDs make natural collisions vanishingly unlikely, but
+    /// a single-tenant install where an admin imports an iCal feed (or a future
+    /// codepath that generates UIDs from a non-UUID source) could produce one.
+    /// The lookup in `cancel_orphaned_booking` is scoped via a join on
+    /// `caldav_sources.account_id = event_types.account_id`, with the source_id
+    /// filter pinning the side we're acting on. This test verifies that scoping.
+    #[tokio::test]
+    async fn cancel_does_not_cross_source_account_boundary() {
+        let pool = setup_test_db().await;
+        // Account A: gets seeded by the helper. Source A, event type A.
+        // We don't act ON source A in this test — we only verify a sync of
+        // source B can't reach across to cancel a booking on account A.
+        let (_source_a_id, et_a_id) = seed_fixtures(&pool).await;
+
+        // Account B: separate user, account, event type, source.
+        let user_b_id = Uuid::new_v4().to_string();
+        let account_b_id = Uuid::new_v4().to_string();
+        let et_b_id = Uuid::new_v4().to_string();
+        let source_b_id = Uuid::new_v4().to_string();
+        let cal_b_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username, enabled) VALUES (?, 'host-b@example.com', 'Host B', 'user', 'local', 'hostb', 1)")
+            .bind(&user_b_id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO accounts (id, name, email, timezone, user_id) VALUES (?, 'Host B', 'host-b@example.com', 'UTC', ?)")
+            .bind(&account_b_id).bind(&user_b_id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO event_types (id, account_id, slug, title, duration_min) VALUES (?, ?, 'intro-b', 'Intro B', 30)")
+            .bind(&et_b_id).bind(&account_b_id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO caldav_sources (id, account_id, name, url, username, write_calendar_href) VALUES (?, ?, 'test-b', 'https://dav-b.example.com/', 'user-b', '/calendars/hostb/default/')")
+            .bind(&source_b_id).bind(&account_b_id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO calendars (id, source_id, href, display_name) VALUES (?, ?, '/calendars/hostb/default/', 'Default B')")
+            .bind(&cal_b_id).bind(&source_b_id).execute(&pool).await.unwrap();
+
+        let shared_uid = "colliding-uid@calrs";
+        let key = [0u8; 32];
+
+        // Confirmed booking on ACCOUNT A — this is what we're protecting.
+        let booking_a_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone,
+                start_at, end_at, status, cancel_token, reschedule_token, caldav_calendar_href)
+             VALUES (?, ?, ?, 'Guest', 'guest@example.com', 'UTC',
+                '2030-06-15T10:00:00', '2030-06-15T10:30:00', 'confirmed', 'ctok', 'rtok',
+                '/calendars/host/default/')",
+        )
+        .bind(&booking_a_id)
+        .bind(&et_a_id)
+        .bind(shared_uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Local event on SOURCE B's calendar with the same UID — so the
+        // DELETE in `delete_events_by_href` will report rows_affected > 0
+        // and the rows_affected gate alone can't save us. Only the
+        // source-scoped lookup keeps booking A safe.
+        sqlx::query(
+            "INSERT INTO events (id, calendar_id, uid, summary, start_at, end_at) \
+             VALUES (?, ?, ?, 'Colliding event on B', '2030-06-15T10:00:00', '2030-06-15T10:30:00')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&cal_b_id)
+        .bind(shared_uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Source B reports the colliding UID as deleted.
+        let href = format!("/calendars/hostb/default/{}.ics", shared_uid);
+        let deleted =
+            delete_events_by_href(&pool, &key, None, &source_b_id, &cal_b_id, &[href]).await;
+        assert_eq!(
+            deleted, 1,
+            "the local event row on source B should have been removed"
+        );
+
+        // Booking on ACCOUNT A must still be confirmed.
+        let status: String = sqlx::query_scalar("SELECT status FROM bookings WHERE id = ?")
+            .bind(&booking_a_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "confirmed",
+            "a sync of source B must not cancel a booking on account A — \
+             source/account scoping is the defense-in-depth boundary"
+        );
     }
 
     #[tokio::test]

@@ -82,6 +82,7 @@
     <div class="booking-info">
       <div><strong>{{ b.event_title }}</strong> with {{ b.guest_name }} <span class="badge badge-pending">pending</span></div>
       <div style="color: var(--text-muted); font-size: 0.85rem;">{{ b.start_at }}</div>
+      {% if b.start_at_guest %}<div style="color: var(--text-muted); font-size: 0.75rem;">Guest booked: {{ b.start_at_guest }}</div>{% endif %}
     </div>
     <div class="booking-actions">
       <form method="post" action="/dashboard/bookings/{{ b.id }}/confirm" style="margin: 0;">
