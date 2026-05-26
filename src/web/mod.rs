@@ -317,8 +317,11 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
         // - event type has reminder_minutes set (> 0)
         // - start_at minus reminder_minutes <= now
         // - start_at > now (don't remind for past bookings)
-        let due: Vec<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT b.id, b.guest_name, b.guest_email, b.guest_timezone, b.start_at, b.end_at, et.title, u.name, COALESCE(u.booking_email, u.email), et.location_value, b.cancel_token, b.uid, b.language, u.language
+        // `host_timezone` resolves like `get_host_tz`: prefer the explicit
+        // event-type tz, fall back to the host user's tz. NULL falls through
+        // to UTC at parse time.
+        let due: Vec<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT b.id, b.guest_name, b.guest_email, b.guest_timezone, b.start_at, b.end_at, et.title, u.name, COALESCE(u.booking_email, u.email), et.location_value, b.cancel_token, b.uid, b.language, u.language, COALESCE(NULLIF(et.timezone, ''), u.timezone)
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
@@ -360,19 +363,27 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
             uid,
             guest_language,
             host_language,
+            host_timezone,
         ) in &due
         {
-            let date = start_at.get(..10).unwrap_or(start_at).to_string();
-            let start_time = extract_time_24h(start_at);
-            let end_time = extract_time_24h(end_at);
+            // start_at/end_at are stored in the event-type tz (see #101). Convert
+            // to the guest's tz so `BookingDetails` carries guest-local wall-clock —
+            // matches the contract used by cancel/confirm handlers, and lets
+            // `host_time_display` convert back into the host's tz correctly for
+            // the host reminder.
+            let stored_tz_str = host_timezone.as_deref().unwrap_or("UTC");
+            let stored_tz = stored_tz_str.parse::<Tz>().unwrap_or(Tz::UTC);
+            let guest_tz_parsed = guest_timezone.parse::<Tz>().unwrap_or(Tz::UTC);
+            let (date, start_time, end_time) =
+                booking_strings_in_guest_tz(start_at, end_at, stored_tz, guest_tz_parsed);
 
             let location = location_value.as_ref().filter(|v| !v.is_empty()).cloned();
 
             let details = crate::email::BookingDetails {
                 event_title: event_title.clone(),
-                date: date.clone(),
-                start_time: start_time.clone(),
-                end_time: end_time.clone(),
+                date,
+                start_time,
+                end_time,
                 guest_name: guest_name.clone(),
                 guest_email: guest_email.clone(),
                 guest_timezone: guest_timezone.clone(),
@@ -385,6 +396,7 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
                 additional_attendees: vec![],
                 guest_language: guest_language.clone(),
                 host_language: host_language.clone(),
+                host_timezone: stored_tz_str.to_string(),
             };
 
             let guest_cancel_url = cancel_token.as_ref().and_then(|t| {
@@ -3741,6 +3753,7 @@ async fn cancel_booking(
             uid,
             reason,
             cancelled_by_host: true,
+            host_timezone: stored_tz.name().to_string(),
             ..Default::default()
         };
 
@@ -3848,6 +3861,7 @@ async fn confirm_booking(
         location: location_value,
         reminder_minutes: None,
         additional_attendees: vec![],
+        host_timezone: stored_tz.name().to_string(),
         ..Default::default()
     };
 
@@ -8554,6 +8568,7 @@ async fn handle_group_booking(
         reminder_minutes: reminder_min,
         additional_attendees: additional_attendees.clone(),
         guest_language: Some(lang.to_string()),
+        host_timezone: host_tz.name().to_string(),
         ..Default::default()
     };
 
@@ -9321,6 +9336,7 @@ async fn handle_dynamic_group_booking(
         reminder_minutes: reminder_min,
         additional_attendees: all_additional.clone(),
         guest_language: Some(lang.to_string()),
+        host_timezone: host_tz.name().to_string(),
         ..Default::default()
     };
 
@@ -10056,6 +10072,7 @@ async fn handle_booking_for_user(
             reminder_minutes: reminder_min,
             additional_attendees: additional_attendees.clone(),
             guest_language: Some(lang.to_string()),
+            host_timezone: host_tz.name().to_string(),
             ..Default::default()
         };
 
@@ -12038,6 +12055,7 @@ async fn handle_booking(
             reminder_minutes: reminder_min,
             additional_attendees: additional_attendees.clone(),
             guest_language: Some(lang.to_string()),
+            host_timezone: host_tz.name().to_string(),
             ..Default::default()
         };
 
@@ -13631,6 +13649,7 @@ async fn approve_booking_by_token(
         location: location_value,
         reminder_minutes: None,
         additional_attendees: vec![],
+        host_timezone: stored_tz.name().to_string(),
         ..Default::default()
     };
 
@@ -13854,6 +13873,7 @@ async fn decline_booking_by_token(
             uid: String::new(),
             reason: reason.clone(),
             cancelled_by_host: true,
+            host_timezone: stored_tz.name().to_string(),
             ..Default::default()
         };
         let _ = crate::email::send_guest_decline_notice(&smtp_config, &details).await;
@@ -14202,6 +14222,7 @@ async fn guest_cancel_booking(
             // Guest is the one cancelling; their browser language now is the
             // best signal we have (they chose this language to view the form).
             guest_language: Some(lang.to_string()),
+            host_timezone: stored_tz.name().to_string(),
             ..Default::default()
         };
 
@@ -14750,9 +14771,12 @@ async fn guest_reschedule_booking(
             .await
             .unwrap_or_default();
 
-    let old_date = old_start_at.get(..10).unwrap_or(&old_start_at).to_string();
-    let old_start_time = extract_time_24h(&old_start_at);
-    let old_end_time = extract_time_24h(&old_end_at);
+    // old_start_at/old_end_at are stored in the event-type tz. Convert into the
+    // guest's tz so `RescheduleDetails` carries guest-local wall-clock for
+    // both the OLD and NEW times — matches the contract used elsewhere and
+    // lets `host_time_display` correctly recover the host wall-clock.
+    let (old_date, old_start_time, old_end_time) =
+        booking_strings_in_guest_tz(&old_start_at, &old_end_at, host_tz, guest_tz);
 
     if needs_approval {
         // Guest-initiated reschedule on requires_confirmation event → pending.
@@ -14789,6 +14813,7 @@ async fn guest_reschedule_booking(
                 host_email,
                 uid: uid.clone(),
                 location: loc_value.clone(),
+                host_timezone: host_tz.name().to_string(),
             };
             let _ = crate::email::send_host_reschedule_request(
                 &smtp_config,
@@ -14828,6 +14853,7 @@ async fn guest_reschedule_booking(
                 location: loc_value,
                 reminder_minutes: None,
                 additional_attendees: vec![],
+                host_timezone: host_tz.name().to_string(),
                 ..Default::default()
             };
             let _ = crate::email::send_guest_pending_notice_ex(
@@ -14856,6 +14882,7 @@ async fn guest_reschedule_booking(
             location: loc_value.clone(),
             reminder_minutes: None,
             additional_attendees: vec![],
+            host_timezone: host_tz.name().to_string(),
             ..Default::default()
         };
         caldav_push_booking(
@@ -14904,6 +14931,7 @@ async fn guest_reschedule_booking(
                     host_email: host_email.clone(),
                     uid,
                     location: loc_value,
+                    host_timezone: host_tz.name().to_string(),
                 },
                 guest_cancel_url.as_deref(),
                 guest_reschedule_url.as_deref(),
@@ -15020,9 +15048,10 @@ async fn host_reschedule_booking(
         String,
         String,
         String,
+        String,
     )> = sqlx::query_as(
         "SELECT b.id, b.uid, b.guest_name, b.guest_email, b.start_at, b.end_at,
-                    et.title, COALESCE(b.guest_timezone, 'UTC')
+                    et.title, COALESCE(b.guest_timezone, 'UTC'), et.id
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
@@ -15034,7 +15063,7 @@ async fn host_reschedule_booking(
     .await
     .unwrap_or(None);
 
-    let (bid, _uid, guest_name, guest_email, start_at, end_at, event_title, guest_timezone) =
+    let (bid, _uid, guest_name, guest_email, start_at, end_at, event_title, guest_timezone, et_id) =
         match booking {
             Some(b) => b,
             None => return Redirect::to("/dashboard/bookings").into_response(),
@@ -15076,9 +15105,14 @@ async fn host_reschedule_booking(
                         .map(|base| format!("{}/booking/cancel/{}", base.trim_end_matches('/'), t))
                 });
 
-        let date = start_at.get(..10).unwrap_or(&start_at).to_string();
-        let start_time = extract_time_24h(&start_at);
-        let end_time = extract_time_24h(&end_at);
+        // start_at/end_at are stored in the event-type tz (see #101). Convert
+        // into the guest's tz before populating BookingDetails so the
+        // guest-facing "pick new time" email shows their wall-clock with their
+        // tz label.
+        let host_tz = get_host_tz(&state.pool, &et_id).await;
+        let guest_tz_parsed = guest_timezone.parse::<Tz>().unwrap_or(Tz::UTC);
+        let (date, start_time, end_time) =
+            booking_strings_in_guest_tz(&start_at, &end_at, host_tz, guest_tz_parsed);
 
         let details = crate::email::BookingDetails {
             event_title,
@@ -15098,6 +15132,7 @@ async fn host_reschedule_booking(
             location: None,
             reminder_minutes: None,
             additional_attendees: vec![],
+            host_timezone: host_tz.name().to_string(),
             ..Default::default()
         };
 
@@ -15659,7 +15694,7 @@ async fn claim_booking(
         guest_tz,
         host_user_id,
         location,
-        _event_type_id,
+        event_type_id,
     ) = match booking {
         Some(b) => b,
         None => {
@@ -15704,6 +15739,8 @@ async fn claim_booking(
         .execute(&state.pool)
         .await;
 
+    let claim_host_tz = get_host_tz(&state.pool, &event_type_id).await;
+
     // Build details with claimant as additional attendee for CalDAV push
     let mut details = crate::email::BookingDetails {
         event_title: event_title.clone(),
@@ -15720,6 +15757,7 @@ async fn claim_booking(
         location,
         reminder_minutes: None,
         additional_attendees: vec![claimant_email.clone()],
+        host_timezone: claim_host_tz.name().to_string(),
         ..Default::default()
     };
 
@@ -22955,6 +22993,42 @@ mod tests {
             .and_hms_opt(10, 30, 0)
             .unwrap();
         assert_eq!(guest_to_host_local(dt, tz, tz), dt);
+    }
+
+    // End-to-end TZ pipeline used by background email paths (reminder loop,
+    // reschedule): `start_at` is stored in the event-type tz, must be converted
+    // to the guest tz to populate BookingDetails, and host_time_display must
+    // recover the host wall-clock for host-targeted emails. Regression for the
+    // reviewer-caught bug where the reminder loop short-circuited the first
+    // conversion and the host email displayed times in the wrong zone.
+    #[test]
+    fn stored_to_host_email_recovers_host_wall_clock() {
+        // Scenario from issue #119: Paris event type, LA guest, booked at
+        // what the guest saw as 07:00 LA = 16:00 Paris. start_at stored as
+        // Paris wall-clock.
+        let stored_start = "2026-05-26T16:00:00";
+        let stored_end = "2026-05-26T16:30:00";
+        let host_tz: Tz = "Europe/Paris".parse().unwrap();
+        let guest_tz: Tz = "America/Los_Angeles".parse().unwrap();
+
+        // Step 1: convert stored (host) -> guest wall-clock, as the reminder
+        // loop and reschedule handler now do before building BookingDetails.
+        let (date, start_time, end_time) =
+            booking_strings_in_guest_tz(stored_start, stored_end, host_tz, guest_tz);
+        assert_eq!(date, "2026-05-26");
+        assert_eq!(start_time, "07:00");
+        assert_eq!(end_time, "07:30");
+
+        // Step 2: host_time_display converts guest wall-clock back to host.
+        let (host_date, time_display) = crate::email::host_time_display(
+            &date,
+            &start_time,
+            &end_time,
+            guest_tz.name(),
+            host_tz.name(),
+        );
+        assert_eq!(host_date, "2026-05-26");
+        assert_eq!(time_display, "16:00 \u{2013} 16:30 (Europe/Paris)");
     }
 
     #[test]
