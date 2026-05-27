@@ -220,8 +220,16 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
             include_str!("../migrations/050_min_notice_cancel_reschedule.sql"),
         ),
         (
-            "051_oauth2_caldav",
-            include_str!("../migrations/051_oauth2_caldav.sql"),
+            "051_per_member_frequency_limit",
+            include_str!("../migrations/051_per_member_frequency_limit.sql"),
+        ),
+        (
+            "052_smtp_tls_mode",
+            include_str!("../migrations/052_smtp_tls_mode.sql"),
+        ),
+        (
+            "053_oauth2_caldav",
+            include_str!("../migrations/053_oauth2_caldav.sql"),
         ),
     ];
 
@@ -830,7 +838,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count.0, 51, "All 51 migrations should be tracked");
+        assert_eq!(count.0, 53, "All 53 migrations should be tracked");
     }
 
     #[tokio::test]
@@ -844,7 +852,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count.0, 51, "Still 51 migrations after second run");
+        assert_eq!(count.0, 53, "Still 53 migrations after second run");
     }
 
     #[tokio::test]

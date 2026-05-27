@@ -317,8 +317,11 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
         // - event type has reminder_minutes set (> 0)
         // - start_at minus reminder_minutes <= now
         // - start_at > now (don't remind for past bookings)
-        let due: Vec<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT b.id, b.guest_name, b.guest_email, b.guest_timezone, b.start_at, b.end_at, et.title, u.name, COALESCE(u.booking_email, u.email), et.location_value, b.cancel_token, b.uid, b.language, u.language
+        // `host_timezone` resolves like `get_host_tz`: prefer the explicit
+        // event-type tz, fall back to the host user's tz. NULL falls through
+        // to UTC at parse time.
+        let due: Vec<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT b.id, b.guest_name, b.guest_email, b.guest_timezone, b.start_at, b.end_at, et.title, u.name, COALESCE(u.booking_email, u.email), et.location_value, b.cancel_token, b.uid, b.language, u.language, COALESCE(NULLIF(et.timezone, ''), u.timezone)
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
@@ -360,19 +363,27 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
             uid,
             guest_language,
             host_language,
+            host_timezone,
         ) in &due
         {
-            let date = start_at.get(..10).unwrap_or(start_at).to_string();
-            let start_time = extract_time_24h(start_at);
-            let end_time = extract_time_24h(end_at);
+            // start_at/end_at are stored in the event-type tz (see #101). Convert
+            // to the guest's tz so `BookingDetails` carries guest-local wall-clock —
+            // matches the contract used by cancel/confirm handlers, and lets
+            // `host_time_display` convert back into the host's tz correctly for
+            // the host reminder.
+            let stored_tz_str = host_timezone.as_deref().unwrap_or("UTC");
+            let stored_tz = stored_tz_str.parse::<Tz>().unwrap_or(Tz::UTC);
+            let guest_tz_parsed = guest_timezone.parse::<Tz>().unwrap_or(Tz::UTC);
+            let (date, start_time, end_time) =
+                booking_strings_in_guest_tz(start_at, end_at, stored_tz, guest_tz_parsed);
 
             let location = location_value.as_ref().filter(|v| !v.is_empty()).cloned();
 
             let details = crate::email::BookingDetails {
                 event_title: event_title.clone(),
-                date: date.clone(),
-                start_time: start_time.clone(),
-                end_time: end_time.clone(),
+                date,
+                start_time,
+                end_time,
                 guest_name: guest_name.clone(),
                 guest_email: guest_email.clone(),
                 guest_timezone: guest_timezone.clone(),
@@ -385,6 +396,7 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
                 additional_attendees: vec![],
                 guest_language: guest_language.clone(),
                 host_language: host_language.clone(),
+                host_timezone: stored_tz_str.to_string(),
             };
 
             let guest_cancel_url = cancel_token.as_ref().and_then(|t| {
@@ -911,6 +923,10 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
             "/dashboard/sources/new",
             get(new_source_form).post(create_source),
         )
+        .route(
+            "/dashboard/sources/{id}/edit",
+            get(edit_source_form).post(update_source),
+        )
         .route("/dashboard/sources/{id}/remove", post(remove_source))
         .route("/dashboard/sources/{id}/test", post(test_source))
         .route("/dashboard/sources/google/connect", get(google_connect))
@@ -1352,12 +1368,14 @@ async fn dashboard_event_types(
 
     let is_admin = user.role == "admin";
 
-    // Get team IDs where user is a member (for showing edit/toggle/delete buttons)
-    let member_team_ids: std::collections::HashSet<String> = if is_admin {
+    // Teams the user is an admin of — used for `can_manage` (edit/toggle/delete)
+    // and "Create team event type" enablement. Regular team members can view but
+    // not manage.
+    let admin_team_ids: std::collections::HashSet<String> = if is_admin {
         std::collections::HashSet::new() // global admins can manage all
     } else {
         let ids: Vec<(String,)> =
-            sqlx::query_as("SELECT team_id FROM team_members WHERE user_id = ?")
+            sqlx::query_as("SELECT team_id FROM team_members WHERE user_id = ? AND role = 'admin'")
                 .bind(&user.id)
                 .fetch_all(&state.pool)
                 .await
@@ -1408,7 +1426,7 @@ async fn dashboard_event_types(
     };
 
     // Whether user can create new team event types (global admin or team admin of at least one team)
-    let can_create_team_et = is_admin || !member_team_ids.is_empty();
+    let can_create_team_et = is_admin || !admin_team_ids.is_empty();
 
     let tmpl = match state.templates.get_template("dashboard_event_types.html") {
         Ok(t) => t,
@@ -1446,7 +1464,7 @@ async fn dashboard_event_types(
         scheduling_mode,
     ) in &team_event_types
     {
-        let can_manage = is_admin || member_team_ids.contains(team_id);
+        let can_manage = is_admin || admin_team_ids.contains(team_id);
         all_et_ctx.push(context! {
             id => id, slug => slug, title => title, duration_min => duration,
             enabled => enabled, active_bookings => active_bookings, visibility => vis,
@@ -1456,7 +1474,9 @@ async fn dashboard_event_types(
             toggle_url => format!("/dashboard/group-event-types/{}/{}/toggle", team_id, slug),
             delete_url => format!("/dashboard/group-event-types/{}/{}/delete", team_id, slug),
             overrides_url => format!("/dashboard/event-types/{}/overrides", slug),
-            view_url => if vis != "private" { Some(format!("/team/{}/{}", team_slug, slug)) } else { None::<String> },
+            // Team event types always get a view link — logged-in team members
+            // can view private/internal slots without an invite token.
+            view_url => Some(format!("/team/{}/{}", team_slug, slug)),
         });
     }
 
@@ -3022,6 +3042,75 @@ async fn is_team_admin(pool: &SqlitePool, user_id: &str, team_id: &str) -> bool 
         > 0
 }
 
+/// Single source of truth for "is this user allowed to manage this event type?"
+/// Policy:
+///   - Global admin: always yes.
+///   - Personal event type (team_id IS NULL): account owner only.
+///   - Team event type: team admin only (regular members cannot mutate).
+///
+/// Takes an event_type_id (not slug) to avoid slug-collision ambiguity.
+async fn can_manage_event_type(
+    pool: &SqlitePool,
+    user: &crate::models::User,
+    event_type_id: &str,
+) -> bool {
+    if user.role == "admin" {
+        return true;
+    }
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM event_types et
+         LEFT JOIN accounts a ON a.id = et.account_id
+         LEFT JOIN team_members tm ON tm.team_id = et.team_id AND tm.user_id = ? AND tm.role = 'admin'
+         WHERE et.id = ? AND (
+             (et.team_id IS NULL AND a.user_id = ?) OR
+             (et.team_id IS NOT NULL AND tm.user_id IS NOT NULL)
+         )",
+    )
+    .bind(&user.id)
+    .bind(event_type_id)
+    .bind(&user.id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        > 0
+}
+
+/// Look up an event type by slug that the (non-admin) user is allowed to
+/// manage. Personal events resolve via the account owner; team events resolve
+/// via team admin role. Global admins should bypass this and look up by slug
+/// directly. Returns (id, title, team_id).
+///
+/// If the user has both a personal event and a team event with the same slug,
+/// the personal event wins. Branch order in `UNION ALL` is not guaranteed by
+/// SQL, so we wrap it in a subquery and order by `team_id IS NULL DESC`
+/// (i.e. NULLs first → personal first) to make the resolution deterministic.
+async fn find_manageable_event_type_by_slug(
+    pool: &SqlitePool,
+    user_id: &str,
+    slug: &str,
+) -> Option<(String, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT id, title, team_id FROM (
+             SELECT et.id, et.title, et.team_id FROM event_types et
+             JOIN accounts a ON a.id = et.account_id
+             WHERE a.user_id = ? AND et.slug = ? AND et.team_id IS NULL
+             UNION ALL
+             SELECT et.id, et.title, et.team_id FROM event_types et
+             JOIN team_members tm ON tm.team_id = et.team_id
+             WHERE tm.user_id = ? AND tm.role = 'admin' AND et.slug = ? AND et.team_id IS NOT NULL
+         )
+         ORDER BY (team_id IS NULL) DESC
+         LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(slug)
+    .bind(user_id)
+    .bind(slug)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None)
+}
+
 #[derive(Deserialize)]
 struct GroupSettingsForm {
     _csrf: Option<String>,
@@ -3671,6 +3760,7 @@ async fn cancel_booking(
             uid,
             reason,
             cancelled_by_host: true,
+            host_timezone: stored_tz.name().to_string(),
             ..Default::default()
         };
 
@@ -3778,6 +3868,7 @@ async fn confirm_booking(
         location: location_value,
         reminder_minutes: None,
         additional_attendees: vec![],
+        host_timezone: stored_tz.name().to_string(),
         ..Default::default()
     };
 
@@ -3898,7 +3989,9 @@ async fn new_event_type_form(
     let user = &auth_user.user;
     let preset = query.get("preset").map(|s| s.as_str()).unwrap_or("");
 
-    // Get teams where the user is a member (global admins see all teams)
+    // Get teams where the user is a team admin (global admins see all teams).
+    // Only team admins can create team event types — regular members see no
+    // teams in the dropdown.
     let groups: Vec<(String, String)> = if user.role == "admin" {
         sqlx::query_as("SELECT t.id, t.name FROM teams t ORDER BY t.name")
             .fetch_all(&state.pool)
@@ -3906,7 +3999,7 @@ async fn new_event_type_form(
             .unwrap_or_default()
     } else {
         sqlx::query_as(
-            "SELECT t.id, t.name FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ? ORDER BY t.name",
+            "SELECT t.id, t.name FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ? AND tm.role = 'admin' ORDER BY t.name",
         )
         .bind(&user.id)
         .fetch_all(&state.pool)
@@ -4123,14 +4216,14 @@ async fn create_event_type(
         .into_response();
     }
 
-    // Verify team membership if a team_id is specified
+    // Only team admins (or global admins) can create team event types.
     if let Some(tid) = team_id {
         let is_global_admin = user.role == "admin";
-        if !is_global_admin && !is_team_member(&state.pool, &user.id, tid).await {
+        if !is_global_admin && !is_team_admin(&state.pool, &user.id, tid).await {
             return render_event_type_form_error(
                 &state,
                 &auth_user,
-                "You are not a member of this team.",
+                "You are not a team admin of this team.",
                 &form,
                 false,
             )
@@ -4292,7 +4385,7 @@ async fn edit_event_type_form(
         "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.buffer_before, et.buffer_after, et.min_notice_min, et.requires_confirmation, et.location_type, et.location_value, et.reminder_minutes, et.visibility, et.max_additional_guests, et.scheduling_mode, et.team_id
          FROM event_types et
          JOIN accounts a ON a.id = et.account_id
-         WHERE a.user_id = ? AND et.slug = ?",
+         WHERE a.user_id = ? AND et.slug = ? AND et.team_id IS NULL",
     )
     .bind(&user.id)
     .bind(&slug)
@@ -4500,8 +4593,8 @@ async fn edit_event_type_form(
     };
 
     // Fetch booking frequency limits
-    let freq_limits: Vec<(i32, String)> = sqlx::query_as(
-        "SELECT max_bookings, period FROM booking_frequency_limits WHERE event_type_id = ?",
+    let freq_limits: Vec<(i32, String, i32)> = sqlx::query_as(
+        "SELECT max_bookings, period, per_member FROM booking_frequency_limits WHERE event_type_id = ?",
     )
     .bind(&et_id)
     .fetch_all(&state.pool)
@@ -4510,7 +4603,13 @@ async fn edit_event_type_form(
 
     let form_frequency_limits = freq_limits
         .iter()
-        .map(|(c, p)| format!("{}:{}", c, p))
+        .map(|(c, p, m)| {
+            if *m != 0 {
+                format!("{}:{}:m", c, p)
+            } else {
+                format!("{}:{}", c, p)
+            }
+        })
         .collect::<Vec<_>>()
         .join(",");
 
@@ -4611,7 +4710,7 @@ async fn update_event_type(
         "SELECT et.id, et.account_id
          FROM event_types et
          JOIN accounts a ON a.id = et.account_id
-         WHERE a.user_id = ? AND et.slug = ?",
+         WHERE a.user_id = ? AND et.slug = ? AND et.team_id IS NULL",
     )
     .bind(&user.id)
     .bind(&slug)
@@ -4795,11 +4894,12 @@ async fn update_event_type_member_priority(
     }
     let user = &auth_user.user;
 
-    // Resolve event type and verify ownership
+    // Resolve a personal event type owned by this user (team priority is
+    // handled by the group-scoped route).
     let et: Option<(String,)> = sqlx::query_as(
         "SELECT et.id FROM event_types et \
          JOIN accounts a ON a.id = et.account_id \
-         WHERE a.user_id = ? AND et.slug = ?",
+         WHERE a.user_id = ? AND et.slug = ? AND et.team_id IS NULL",
     )
     .bind(&user.id)
     .bind(&slug)
@@ -4931,7 +5031,7 @@ async fn toggle_event_type(
 
     let _ = sqlx::query(
         "UPDATE event_types SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END
-         WHERE slug = ? AND account_id IN (SELECT id FROM accounts WHERE user_id = ?)",
+         WHERE slug = ? AND team_id IS NULL AND account_id IN (SELECT id FROM accounts WHERE user_id = ?)",
     )
     .bind(&slug)
     .bind(&user.id)
@@ -4955,11 +5055,12 @@ async fn delete_event_type(
     }
     let user = &auth_user.user;
 
-    // Find the event type owned by this user
+    // Find the personal event type owned by this user (team event types are
+    // managed via the team-scoped routes).
     let et: Option<(String,)> = sqlx::query_as(
         "SELECT et.id FROM event_types et
          JOIN accounts a ON a.id = et.account_id
-         WHERE et.slug = ? AND a.user_id = ?",
+         WHERE et.slug = ? AND a.user_id = ? AND et.team_id IS NULL",
     )
     .bind(&slug)
     .bind(&user.id)
@@ -5222,6 +5323,200 @@ fn render_source_form_error(
         })
         .unwrap_or_else(|e| internal_error_body("template render", &e)),
     )
+}
+
+/// Render the source form in editing mode with the given values.
+fn render_source_edit_form(
+    state: &AppState,
+    auth_user: &crate::auth::AuthUser,
+    source_id: &str,
+    name: &str,
+    url: &str,
+    username: &str,
+    error: &str,
+) -> Html<String> {
+    let tmpl = match state.templates.get_template("source_form.html") {
+        Ok(t) => t,
+        Err(e) => return Html(format!("Template error: {}", e)),
+    };
+
+    let providers: Vec<minijinja::Value> = caldav_providers()
+        .iter()
+        .map(|(id, name, url)| context! { id => id, name => name, url => url })
+        .collect();
+
+    let (impersonating, impersonating_name, _) = impersonation_ctx(auth_user);
+    Html(
+        tmpl.render(context! {
+            editing => true,
+            source_id => source_id,
+            providers => providers,
+            form_provider => "other",
+            form_name => name,
+            form_url => url,
+            form_username => username,
+            error => error,
+            sidebar => sidebar_context(auth_user, "sources"),
+            impersonating => impersonating,
+            impersonating_name => impersonating_name,
+        })
+        .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
+}
+
+async fn edit_source_form(
+    State(state): State<Arc<AppState>>,
+    auth_user: crate::auth::AuthUser,
+    Path(source_id): Path<String>,
+) -> impl IntoResponse {
+    let user = &auth_user.user;
+    // Verify ownership and load current values.
+    let source: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT cs.name, cs.url, cs.username
+         FROM caldav_sources cs
+         JOIN accounts a ON a.id = cs.account_id
+         WHERE cs.id = ? AND a.user_id = ?",
+    )
+    .bind(&source_id)
+    .bind(&user.id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let (name, url, username) = match source {
+        Some(s) => s,
+        None => return Redirect::to("/dashboard/sources").into_response(),
+    };
+
+    render_source_edit_form(&state, &auth_user, &source_id, &name, &url, &username, "")
+        .into_response()
+}
+
+async fn update_source(
+    State(state): State<Arc<AppState>>,
+    auth_user: crate::auth::AuthUser,
+    headers: HeaderMap,
+    Path(source_id): Path<String>,
+    Form(form): Form<SourceForm>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_csrf_token(&headers, &form._csrf) {
+        return resp;
+    }
+    let user = &auth_user.user;
+
+    // Confirm the source belongs to this user and grab the existing
+    // password (used as fallback when the form leaves it blank).
+    let existing: Option<(String,)> = sqlx::query_as(
+        "SELECT cs.password_enc
+         FROM caldav_sources cs
+         JOIN accounts a ON a.id = cs.account_id
+         WHERE cs.id = ? AND a.user_id = ?",
+    )
+    .bind(&source_id)
+    .bind(&user.id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let existing_password_enc = match existing {
+        Some((enc,)) => enc,
+        None => return Redirect::to("/dashboard/sources").into_response(),
+    };
+
+    let url = form.url.trim().to_string();
+    let username = form.username.trim().to_string();
+    let name = form.name.trim().to_string();
+
+    if url.is_empty() || username.is_empty() || name.is_empty() {
+        return render_source_edit_form(
+            &state,
+            &auth_user,
+            &source_id,
+            &form.name,
+            &form.url,
+            &form.username,
+            "Name, URL, and username are required.",
+        )
+        .into_response();
+    }
+
+    if let Err(e) = crate::caldav::validate_caldav_url(&url) {
+        return render_source_edit_form(
+            &state,
+            &auth_user,
+            &source_id,
+            &name,
+            &url,
+            &username,
+            &e.to_string(),
+        )
+        .into_response();
+    }
+
+    // Resolve the password we'll actually use for the test + storage.
+    // Empty form password means "keep existing"; we decrypt the stored
+    // blob so the connection test exercises the same credentials that
+    // sync will use afterwards.
+    let password_changed = !form.password.is_empty();
+    let plaintext_password = if password_changed {
+        form.password.clone()
+    } else {
+        match crate::crypto::decrypt_password(&state.secret_key, &existing_password_enc) {
+            Ok(p) => p,
+            Err(_) => {
+                return Html("Failed to decrypt stored credentials.".to_string()).into_response()
+            }
+        }
+    };
+
+    let skip_test = form.no_test.as_deref() == Some("on");
+    if !skip_test {
+        let client = crate::caldav::CaldavClient::new(&url, &username, &plaintext_password);
+        if let Err(e) = client.check_connection().await {
+            let msg = format!("Connection failed: {}. Check the URL and credentials, or check \"Skip connection test\" to save anyway.", e);
+            return render_source_edit_form(
+                &state, &auth_user, &source_id, &name, &url, &username, &msg,
+            )
+            .into_response();
+        }
+    }
+
+    if password_changed {
+        let new_enc = match crate::crypto::encrypt_password(&state.secret_key, &plaintext_password)
+        {
+            Ok(enc) => enc,
+            Err(_) => return Html("Encryption error.".to_string()).into_response(),
+        };
+        let _ = sqlx::query(
+            "UPDATE caldav_sources SET name = ?, url = ?, username = ?, password_enc = ? WHERE id = ?",
+        )
+        .bind(&name)
+        .bind(&url)
+        .bind(&username)
+        .bind(&new_enc)
+        .bind(&source_id)
+        .execute(&state.pool)
+        .await;
+    } else {
+        let _ =
+            sqlx::query("UPDATE caldav_sources SET name = ?, url = ?, username = ? WHERE id = ?")
+                .bind(&name)
+                .bind(&url)
+                .bind(&username)
+                .bind(&source_id)
+                .execute(&state.pool)
+                .await;
+    }
+
+    tracing::info!(
+        source_id = %source_id,
+        source_name = %name,
+        password_changed = %password_changed,
+        user = %auth_user.user.email,
+        "CalDAV source updated"
+    );
+
+    Redirect::to("/dashboard/sources").into_response()
 }
 
 async fn remove_source(
@@ -5875,22 +6170,13 @@ async fn render_invite_management(
         None => return Html("Private event type not found.".to_string()).into_response(),
     };
 
-    if visibility == "private" {
-        let is_owner: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM event_types et
-             LEFT JOIN accounts a ON a.id = et.account_id
-             LEFT JOIN team_members tm ON tm.team_id = et.team_id AND tm.user_id = ?
-             WHERE et.id = ? AND (a.user_id = ? OR tm.user_id IS NOT NULL)",
-        )
-        .bind(&auth_user.user.id)
-        .bind(&et_id)
-        .bind(&auth_user.user.id)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or(false);
-        if !is_owner {
-            return Html("Access denied.".to_string()).into_response();
-        }
+    // Internal event types: any authenticated user can issue invites — that's
+    // the documented "any authenticated colleague can distribute" contract.
+    // Private event types: invite issuance is management (admin / owner /
+    // team admin only).
+    if visibility == "private" && !can_manage_event_type(&state.pool, &auth_user.user, &et_id).await
+    {
+        return Html("Access denied.".to_string()).into_response();
     }
 
     let invites: Vec<(String, String, String, String, Option<String>, Option<String>, i32, i32, String, String)> = sqlx::query_as(
@@ -5950,6 +6236,12 @@ async fn render_invite_management(
         )
         .collect();
 
+    // Internal events let any authenticated user *create* invites, but only
+    // admins/owners can *delete* them. Pass `can_delete_invites` to the
+    // template so it can hide the Delete button for users who'd just hit a
+    // 403 — keeps the UI consistent with the SQL gate in `delete_invite`.
+    let can_delete_invites = can_manage_event_type(&state.pool, &auth_user.user, &et_id).await;
+
     let tmpl = match state.templates.get_template("invite_form.html") {
         Ok(t) => t,
         Err(e) => return internal_error_response("template render", &e),
@@ -5970,6 +6262,7 @@ async fn render_invite_management(
             owner_name => owner_name,
             invites => invites_ctx,
             bulk_result => bulk_ctx,
+            can_delete_invites => can_delete_invites,
             success => "",
             error => "",
         })
@@ -6018,22 +6311,12 @@ async fn send_invite_bulk(
         None => return Redirect::to("/dashboard/event-types").into_response(),
     };
 
-    if visibility == "private" {
-        let is_owner: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM event_types et
-             LEFT JOIN accounts a ON a.id = et.account_id
-             LEFT JOIN team_members tm ON tm.team_id = et.team_id AND tm.user_id = ?
-             WHERE et.id = ? AND (a.user_id = ? OR tm.user_id IS NOT NULL)",
-        )
-        .bind(&auth_user.user.id)
-        .bind(&et_id)
-        .bind(&auth_user.user.id)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or(false);
-        if !is_owner {
-            return Redirect::to("/dashboard/event-types").into_response();
-        }
+    // Private event types: invite issuance is management (admin / owner / team
+    // admin only). Internal event types: any authenticated user can issue
+    // invites, matching the quick-link contract.
+    if visibility == "private" && !can_manage_event_type(&state.pool, &auth_user.user, &et_id).await
+    {
+        return Redirect::to("/dashboard/event-types").into_response();
     }
 
     let (valid_recipients, mut result) = parse_bulk_recipients(&form.recipients, MAX_BULK_INVITES);
@@ -6157,20 +6440,34 @@ async fn delete_invite(
         return resp;
     }
 
-    // Get the event_type_id before deleting for redirect, with ownership check
-    let et_id: Option<String> = sqlx::query_scalar(
-        "SELECT bi.event_type_id FROM booking_invites bi
-         JOIN event_types et ON et.id = bi.event_type_id
-         LEFT JOIN accounts a ON a.id = et.account_id
-         LEFT JOIN team_members tm ON tm.team_id = et.team_id AND tm.user_id = ?
-         WHERE bi.id = ? AND (a.user_id = ? OR tm.user_id IS NOT NULL)",
-    )
-    .bind(&auth_user.user.id)
-    .bind(&invite_id)
-    .bind(&auth_user.user.id)
-    .fetch_optional(&state.pool)
-    .await
-    .unwrap_or(None);
+    // Allow delete for: global admin, personal event type creator, the user who
+    // created this specific invite, or a team admin of the team that owns the
+    // event type.
+    let is_global_admin = auth_user.user.role == "admin";
+    let et_id: Option<String> = if is_global_admin {
+        sqlx::query_scalar("SELECT event_type_id FROM booking_invites WHERE id = ?")
+            .bind(&invite_id)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None)
+    } else {
+        sqlx::query_scalar(
+            "SELECT bi.event_type_id FROM booking_invites bi
+             JOIN event_types et ON et.id = bi.event_type_id
+             LEFT JOIN accounts a ON a.id = et.account_id
+             LEFT JOIN team_members tm ON tm.team_id = et.team_id AND tm.user_id = ? AND tm.role = 'admin'
+             WHERE bi.id = ? AND (
+                 (et.team_id IS NULL AND a.user_id = ?) OR
+                 (et.team_id IS NOT NULL AND tm.user_id IS NOT NULL)
+             )",
+        )
+        .bind(&auth_user.user.id)
+        .bind(&invite_id)
+        .bind(&auth_user.user.id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None)
+    };
 
     if et_id.is_some() {
         let _ = sqlx::query("DELETE FROM booking_invites WHERE id = ?")
@@ -6221,23 +6518,13 @@ async fn generate_quick_link(
         None => return Redirect::to("/dashboard/invite-links").into_response(),
     };
 
-    // Private event types: only owner or team member can generate quick links
-    if visibility == "private" {
-        let is_owner: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM event_types et
-             LEFT JOIN accounts a ON a.id = et.account_id
-             LEFT JOIN team_members tm ON tm.team_id = et.team_id AND tm.user_id = ?
-             WHERE et.id = ? AND (a.user_id = ? OR tm.user_id IS NOT NULL)",
-        )
-        .bind(&auth_user.user.id)
-        .bind(&et_id)
-        .bind(&auth_user.user.id)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or(false);
-        if !is_owner {
-            return Redirect::to("/dashboard/invite-links").into_response();
-        }
+    // Private event types: only owner (personal) or team admin (team event)
+    // can generate quick links. Internal event types remain open to any
+    // authenticated user — that's the documented "any authenticated colleague
+    // can distribute a one-time link" contract.
+    if visibility == "private" && !can_manage_event_type(&state.pool, &auth_user.user, &et_id).await
+    {
+        return Redirect::to("/dashboard/invite-links").into_response();
     }
 
     let token = uuid::Uuid::new_v4().to_string();
@@ -6280,15 +6567,19 @@ async fn overrides_page(
     Path(slug): Path<String>,
 ) -> impl IntoResponse {
     let user = &auth_user.user;
+    let is_global_admin = user.role == "admin";
 
-    let et: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT et.id, et.title, et.team_id FROM event_types et JOIN accounts a ON a.id = et.account_id WHERE a.user_id = ? AND et.slug = ?",
-    )
-    .bind(&user.id)
-    .bind(&slug)
-    .fetch_optional(&state.pool)
-    .await
-    .unwrap_or(None);
+    let et: Option<(String, String, Option<String>)> = if is_global_admin {
+        sqlx::query_as(
+            "SELECT et.id, et.title, et.team_id FROM event_types et WHERE et.slug = ? LIMIT 1",
+        )
+        .bind(&slug)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None)
+    } else {
+        find_manageable_event_type_by_slug(&state.pool, &user.id, &slug).await
+    };
 
     let (et_id, et_title, team_id) = match et {
         Some(e) => e,
@@ -6364,15 +6655,19 @@ async fn create_override(
         return resp;
     }
     let user = &auth_user.user;
+    let is_global_admin = user.role == "admin";
 
-    let et_id: Option<String> = sqlx::query_scalar(
-        "SELECT et.id FROM event_types et JOIN accounts a ON a.id = et.account_id WHERE a.user_id = ? AND et.slug = ?",
-    )
-    .bind(&user.id)
-    .bind(&slug)
-    .fetch_optional(&state.pool)
-    .await
-    .unwrap_or(None);
+    let et_id: Option<String> = if is_global_admin {
+        sqlx::query_scalar("SELECT id FROM event_types WHERE slug = ? LIMIT 1")
+            .bind(&slug)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None)
+    } else {
+        find_manageable_event_type_by_slug(&state.pool, &user.id, &slug)
+            .await
+            .map(|(id, _, _)| id)
+    };
 
     let et_id = match et_id {
         Some(id) => id,
@@ -6438,16 +6733,24 @@ async fn delete_override(
     }
     let user = &auth_user.user;
 
-    // Verify the override belongs to an event type the user owns
-    let _ = sqlx::query(
-        "DELETE FROM availability_overrides WHERE id = ? AND event_type_id IN (SELECT et.id FROM event_types et JOIN accounts a ON a.id = et.account_id WHERE a.user_id = ?)",
-    )
-    .bind(&override_id)
-    .bind(&user.id)
-    .execute(&state.pool)
-    .await;
+    // Look up the override's event type, then check management policy via
+    // `can_manage_event_type` so the rule lives in one place.
+    let target_et_id: Option<String> =
+        sqlx::query_scalar("SELECT event_type_id FROM availability_overrides WHERE id = ?")
+            .bind(&override_id)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
 
-    tracing::info!(override_id = %override_id, deleted_by = %user.email, "availability override deleted");
+    if let Some(et_id) = target_et_id {
+        if can_manage_event_type(&state.pool, user, &et_id).await {
+            let _ = sqlx::query("DELETE FROM availability_overrides WHERE id = ?")
+                .bind(&override_id)
+                .execute(&state.pool)
+                .await;
+            tracing::info!(override_id = %override_id, deleted_by = %user.email, "availability override deleted");
+        }
+    }
 
     Redirect::to(&format!("/dashboard/event-types/{}/overrides", slug)).into_response()
 }
@@ -6468,7 +6771,7 @@ async fn new_group_event_type_form(
             .unwrap_or_default()
     } else {
         sqlx::query_as(
-            "SELECT t.id, t.name FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ? ORDER BY t.name",
+            "SELECT t.id, t.name FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ? AND tm.role = 'admin' ORDER BY t.name",
         )
         .bind(&user.id)
         .fetch_all(&state.pool)
@@ -6480,7 +6783,7 @@ async fn new_group_event_type_form(
         return Html(if is_admin {
             "No teams exist yet.".to_string()
         } else {
-            "You are not a member of any teams.".to_string()
+            "You are not a team admin of any teams.".to_string()
         });
     }
 
@@ -6560,9 +6863,9 @@ async fn create_group_event_type(
 
     let is_admin = user.role == "admin";
 
-    // Verify user is a team member (global admins can manage any team)
-    if !is_admin && !is_team_member(&state.pool, &user.id, &team_id).await {
-        return Html("You are not a member of this team.".to_string()).into_response();
+    // Only team admins (and global admins) can create team event types
+    if !is_admin && !is_team_admin(&state.pool, &user.id, &team_id).await {
+        return Html("You are not a team admin of this team.".to_string()).into_response();
     }
 
     // Find the user's account
@@ -6718,6 +7021,9 @@ async fn create_group_event_type(
         }
     }
 
+    // Save booking frequency limits
+    save_frequency_limits(&state.pool, &et_id, &form.frequency_limits).await;
+
     Redirect::to("/dashboard/event-types").into_response()
 }
 
@@ -6763,7 +7069,7 @@ async fn edit_group_event_type_form(
             "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.buffer_before, et.buffer_after, et.min_notice_min, et.requires_confirmation, et.location_type, et.location_value, et.reminder_minutes, et.team_id, et.visibility, et.max_additional_guests, et.scheduling_mode
              FROM event_types et
              JOIN team_members tm ON tm.team_id = et.team_id
-             WHERE tm.user_id = ? AND et.team_id = ? AND et.slug = ?",
+             WHERE tm.user_id = ? AND tm.role = 'admin' AND et.team_id = ? AND et.slug = ?",
         )
         .bind(&user.id)
         .bind(&team_id)
@@ -6965,6 +7271,27 @@ async fn edit_group_event_type_form(
         .collect::<Vec<_>>()
         .join(",");
 
+    // Fetch booking frequency limits
+    let freq_limits: Vec<(i32, String, i32)> = sqlx::query_as(
+        "SELECT max_bookings, period, per_member FROM booking_frequency_limits WHERE event_type_id = ?",
+    )
+    .bind(&et_id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    let form_frequency_limits = freq_limits
+        .iter()
+        .map(|(c, p, m)| {
+            if *m != 0 {
+                format!("{}:{}:m", c, p)
+            } else {
+                format!("{}:{}", c, p)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
     let tmpl = match state.templates.get_template("event_type_form.html") {
         Ok(t) => t,
         Err(e) => return internal_error_html("template render", &e),
@@ -6999,6 +7326,7 @@ async fn edit_group_event_type_form(
             form_scheduling_mode => scheduling_mode,
             form_default_calendar_view => default_calendar_view,
             form_first_slot_only => first_slot_only != 0,
+            form_frequency_limits => form_frequency_limits,
             form_timezone => &form_timezone,
             form_cancel_notice_value => form_cancel_notice_value,
             form_cancel_notice_unit => form_cancel_notice_unit,
@@ -7052,7 +7380,7 @@ async fn update_group_event_type(
             "SELECT et.id, et.team_id
              FROM event_types et
              JOIN team_members tm ON tm.team_id = et.team_id
-             WHERE tm.user_id = ? AND et.team_id = ? AND et.slug = ?",
+             WHERE tm.user_id = ? AND tm.role = 'admin' AND et.team_id = ? AND et.slug = ?",
         )
         .bind(&user.id)
         .bind(&team_id)
@@ -7213,6 +7541,13 @@ async fn update_group_event_type(
         }
     }
 
+    // Update booking frequency limits: delete old, insert new
+    let _ = sqlx::query("DELETE FROM booking_frequency_limits WHERE event_type_id = ?")
+        .bind(&et_id)
+        .execute(&state.pool)
+        .await;
+    save_frequency_limits(&state.pool, &et_id, &form.frequency_limits).await;
+
     Redirect::to("/dashboard/event-types").into_response()
 }
 
@@ -7242,7 +7577,8 @@ async fn toggle_group_event_type(
         sqlx::query_as(
             "SELECT et.id FROM event_types et \
              JOIN team_members tm ON tm.team_id = et.team_id \
-             WHERE et.team_id = ? AND et.slug = ? AND tm.user_id = ?",
+             WHERE et.team_id = ? AND et.slug = ? AND tm.user_id = ? AND tm.role = 'admin' \
+             LIMIT 1",
         )
         .bind(&team_id)
         .bind(&slug)
@@ -7294,7 +7630,7 @@ async fn delete_group_event_type(
         sqlx::query_as(
             "SELECT et.id FROM event_types et
              JOIN team_members tm ON tm.team_id = et.team_id
-             WHERE et.team_id = ? AND et.slug = ? AND tm.user_id = ?",
+             WHERE et.team_id = ? AND et.slug = ? AND tm.user_id = ? AND tm.role = 'admin' LIMIT 1",
         )
         .bind(&team_id)
         .bind(&slug)
@@ -7411,6 +7747,7 @@ async fn redirect_team_link_to_team(
 
 async fn team_profile_page(
     State(state): State<Arc<AppState>>,
+    optional_auth: crate::auth::OptionalAuthUser,
     Path(team_slug): Path<String>,
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
@@ -7433,9 +7770,17 @@ async fn team_profile_page(
         None => return Html("Team not found.".to_string()),
     };
 
-    // Gate private teams behind invite token
+    // Logged-in team members (and global admins) bypass the private-team
+    // invite token gate — their membership is the access. Compute once and
+    // reuse for both the gate below and the event-type filter further down.
+    let viewer_is_member_or_admin = match &optional_auth.user {
+        Some(u) if u.role == "admin" => true,
+        Some(u) => is_team_member(&state.pool, &u.id, &team_id).await,
+        None => false,
+    };
+
     let passed_invite = query.get("invite").cloned().unwrap_or_default();
-    if team_visibility == "private" {
+    if team_visibility == "private" && !viewer_is_member_or_admin {
         match &team_invite_token {
             Some(expected) if !passed_invite.is_empty() && passed_invite == *expected => {
                 // valid — continue
@@ -7446,16 +7791,34 @@ async fn team_profile_page(
         }
     }
 
-    let event_types: Vec<(String, String, Option<String>, i32)> = sqlx::query_as(
-        "SELECT et.slug, et.title, et.description, et.duration_min
-         FROM event_types et
-         WHERE et.team_id = ? AND et.enabled = 1 AND et.visibility = 'public'
-         ORDER BY et.created_at",
-    )
-    .bind(&team_id)
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
+    // Logged-in team members (and global admins) see all enabled event types,
+    // including private/internal — they have view access via the slot pages
+    // anyway, so showing them on the profile makes them discoverable. Anonymous
+    // visitors and non-members continue to see only public event types.
+    let event_types: Vec<(String, String, Option<String>, i32, String)> =
+        if viewer_is_member_or_admin {
+            sqlx::query_as(
+                "SELECT et.slug, et.title, et.description, et.duration_min, et.visibility
+             FROM event_types et
+             WHERE et.team_id = ? AND et.enabled = 1
+             ORDER BY et.created_at",
+            )
+            .bind(&team_id)
+            .fetch_all(&state.pool)
+            .await
+            .unwrap_or_default()
+        } else {
+            sqlx::query_as(
+                "SELECT et.slug, et.title, et.description, et.duration_min, et.visibility
+             FROM event_types et
+             WHERE et.team_id = ? AND et.enabled = 1 AND et.visibility = 'public'
+             ORDER BY et.created_at",
+            )
+            .bind(&team_id)
+            .fetch_all(&state.pool)
+            .await
+            .unwrap_or_default()
+        };
 
     let members: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT u.id, u.name, u.avatar_path FROM users u \
@@ -7487,8 +7850,14 @@ async fn team_profile_page(
 
     let et_ctx: Vec<minijinja::Value> = event_types
         .iter()
-        .map(|(slug, title, desc, duration)| {
-            context! { slug => slug, title => title, description => desc.as_deref().map(crate::utils::render_inline_markdown), duration_min => duration }
+        .map(|(slug, title, desc, duration, visibility)| {
+            context! {
+                slug => slug,
+                title => title,
+                description => desc.as_deref().map(crate::utils::render_inline_markdown),
+                duration_min => duration,
+                visibility => visibility,
+            }
         })
         .collect();
 
@@ -7518,6 +7887,7 @@ async fn team_profile_page(
 
 async fn show_group_slots(
     State(state): State<Arc<AppState>>,
+    optional_auth: crate::auth::OptionalAuthUser,
     headers: HeaderMap,
     Path((team_slug, slug)): Path<(String, String)>,
     Query(query): Query<SlotsQuery>,
@@ -7557,42 +7927,95 @@ async fn show_group_slots(
         None => return Html("Event type not found.".to_string()),
     };
 
-    // Validate access: booking invite (for private/internal ET) or team invite (for private team)
-    if visibility == "private" || visibility == "internal" {
-        // Event type requires a booking invite
-        let token = match &query.invite {
-            Some(t) => t,
-            None => return Html("This event type requires an invite link.".to_string()),
-        };
-        let invite: Option<(Option<String>, i32, i32)> = sqlx::query_as(
-            "SELECT expires_at, max_uses, used_count FROM booking_invites WHERE token = ? AND event_type_id = ?",
-        )
-        .bind(token)
-        .bind(&et_id)
-        .fetch_optional(&state.pool)
-        .await
-        .unwrap_or(None);
+    // Resolve the team id once and reuse for membership checks and downstream
+    // queries. Can't fold this into the event-type SELECT above because sqlx
+    // tuples cap at 16 columns and we're already at the limit.
+    let team_id: String = match sqlx::query_scalar::<_, String>(
+        "SELECT team_id FROM event_types WHERE id = ? AND team_id IS NOT NULL",
+    )
+    .bind(&et_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None)
+    {
+        Some(tid) => tid,
+        None => return Html("Event type not found.".to_string()),
+    };
 
-        match invite {
-            None => return Html("Invalid invite link.".to_string()),
-            Some((expires_at, max_uses, used_count)) => {
-                if let Some(exp) = &expires_at {
-                    if exp < &chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string() {
-                        return Html("This invite link has expired.".to_string());
-                    }
+    // Global admins can view any team event type (matches their management
+    // surface). Booking is still invite-gated for private/internal events;
+    // global admins do not auto-bypass the booking gate.
+    let is_logged_in_team_member = match &optional_auth.user {
+        Some(u) if u.role == "admin" => true,
+        Some(u) => is_team_member(&state.pool, &u.id, &team_id).await,
+        None => false,
+    };
+
+    // Validate booking invite token if one was provided (used both for direct
+    // booking-invite access and to mark the request as "can_book").
+    let has_valid_booking_invite = if let Some(token) = query.invite.as_deref() {
+        if token.is_empty() {
+            false
+        } else {
+            let invite: Option<(Option<String>, i32, i32)> = sqlx::query_as(
+                "SELECT expires_at, max_uses, used_count FROM booking_invites WHERE token = ? AND event_type_id = ?",
+            )
+            .bind(token)
+            .bind(&et_id)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+            match invite {
+                Some((expires_at, max_uses, used_count)) => {
+                    let not_expired = expires_at.as_deref().is_none_or(|exp| {
+                        exp >= chrono::Utc::now()
+                            .format("%Y-%m-%d %H:%M:%S")
+                            .to_string()
+                            .as_str()
+                    });
+                    not_expired && used_count < max_uses
                 }
-                if used_count >= max_uses {
-                    return Html("This invite link has already been used.".to_string());
-                }
+                None => false,
             }
         }
-    } else if team_visibility == "private" {
-        // Public event type on a private team — needs the team invite token
-        let valid = matches!((&team_invite_token, &query.invite), (Some(expected), Some(provided)) if !provided.is_empty() && provided == expected);
-        if !valid {
-            return Html("Event type not found.".to_string());
-        }
+    } else {
+        false
+    };
+
+    // Did the request supply a valid team-level invite token? Used for private
+    // teams hosting public event types (legacy behavior preserved).
+    let has_valid_team_invite = matches!(
+        (&team_invite_token, &query.invite),
+        (Some(expected), Some(provided)) if !provided.is_empty() && provided == expected
+    );
+
+    // Access matrix:
+    //   public team + public event       → anyone
+    //   private team + public event      → team invite OR logged-in team member
+    //   any team + private/internal event → booking invite OR logged-in team member (view only)
+    let can_view = match (team_visibility.as_str(), visibility.as_str()) {
+        (_, "private") | (_, "internal") => has_valid_booking_invite || is_logged_in_team_member,
+        ("private", _) => has_valid_team_invite || is_logged_in_team_member,
+        _ => true,
+    };
+
+    if !can_view {
+        let msg = if visibility == "private" || visibility == "internal" {
+            "This event type requires an invite link."
+        } else {
+            // Public event on private team without team invite — preserve legacy
+            // "Event type not found" response so we don't leak existence.
+            "Event type not found."
+        };
+        return Html(msg.to_string());
     }
+
+    // can_book: only with a valid booking invite for private/internal events.
+    // Public events: anyone who can view can also book.
+    let can_book = match visibility.as_str() {
+        "private" | "internal" => has_valid_booking_invite,
+        _ => can_view,
+    };
 
     let guest_tz = parse_guest_tz(query.tz.as_deref());
     let host_tz = get_host_tz(&state.pool, &et_id).await;
@@ -7616,14 +8039,8 @@ async fn show_group_slots(
     let end_date = now_host.date() + Duration::days((start_offset + days_ahead) as i64);
     let window_end = end_date.and_hms_opt(23, 59, 59).unwrap_or(now_host);
 
-    let team_id: Option<String> =
-        sqlx::query_scalar("SELECT team_id FROM event_types WHERE id = ?")
-            .bind(&et_id)
-            .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None)
-            .flatten();
-    let busy = if let Some(ref tid) = team_id {
+    let busy = {
+        let tid = &team_id;
         let members: Vec<(String,)> = sqlx::query_as(
             "SELECT u.id FROM users u JOIN team_members tm ON tm.user_id = u.id \
              LEFT JOIN event_type_member_weights etw ON etw.user_id = u.id AND etw.event_type_id = ? \
@@ -7669,27 +8086,6 @@ async fn show_group_slots(
         } else {
             BusySource::Group(member_busy)
         }
-    } else {
-        // Fallback for individual event type (shouldn't happen on group route, but be safe)
-        let owner_id: String = sqlx::query_scalar(
-            "SELECT a.user_id FROM accounts a JOIN event_types et ON et.account_id = a.id WHERE et.id = ?",
-        )
-        .bind(&et_id)
-        .fetch_optional(&state.pool)
-        .await
-        .unwrap_or(None)
-        .unwrap_or_default();
-        BusySource::Individual(
-            fetch_busy_times_for_user(
-                &state.pool,
-                &owner_id,
-                now_host,
-                window_end,
-                host_tz,
-                Some(&et_id),
-            )
-            .await,
-        )
     };
 
     let slot_days = compute_slots(
@@ -7726,14 +8122,15 @@ async fn show_group_slots(
         .map(|(iana, label)| context! { value => iana, label => label, selected => (*iana == guest_tz_name) })
         .collect();
 
-    // Fetch team ID and avatar for sidebar display
-    let team_info: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT id, avatar_path FROM teams WHERE slug = ?")
-            .bind(&team_slug)
+    // Fetch team avatar for sidebar display (team_id is already in scope from
+    // the initial event-type lookup).
+    let team_avatar_path: Option<String> =
+        sqlx::query_scalar("SELECT avatar_path FROM teams WHERE id = ?")
+            .bind(&team_id)
             .fetch_optional(&state.pool)
             .await
-            .unwrap_or(None);
-    let (team_id, team_avatar_path) = team_info.unwrap_or_default();
+            .unwrap_or(None)
+            .flatten();
 
     // Fetch active team members for sidebar display (exclude members with weight=0)
     let team_members_rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
@@ -7796,6 +8193,7 @@ async fn show_group_slots(
             default_calendar_view => default_calendar_view,
             company_link => state.company_link.read().await.clone(),
             lang => lang,
+            can_book => can_book,
         })
         .unwrap_or_else(|e| internal_error_body("template render", &e));
 
@@ -7804,13 +8202,14 @@ async fn show_group_slots(
 
 async fn show_group_book_form(
     State(state): State<Arc<AppState>>,
+    optional_auth: crate::auth::OptionalAuthUser,
     headers: HeaderMap,
     Path((team_slug, slug)): Path<(String, String)>,
     Query(query): Query<BookQuery>,
 ) -> impl IntoResponse {
     let lang = crate::i18n::detect_from_headers(&headers);
-    let et: Option<(String, String, String, Option<String>, i32, String, Option<String>, String, String, i32, String, Option<String>)> = sqlx::query_as(
-        "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.location_type, et.location_value, t.name, et.visibility, et.max_additional_guests, t.visibility, t.invite_token
+    let et: Option<(String, String, String, Option<String>, i32, String, Option<String>, String, String, i32, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.location_type, et.location_value, t.name, et.visibility, et.max_additional_guests, t.visibility, t.invite_token, t.id
          FROM event_types et
          JOIN teams t ON t.id = et.team_id
          WHERE t.slug = ? AND et.slug = ? AND et.enabled = 1",
@@ -7834,12 +8233,21 @@ async fn show_group_book_form(
         max_additional_guests,
         team_visibility,
         team_invite_token,
+        team_id,
     ) = match et {
         Some(e) => e,
         None => return Html("Event type not found.".to_string()),
     };
 
-    // Validate access
+    // Logged-in team members (and global admins) substitute for the team
+    // invite token on public events of private teams. Private/internal events
+    // still require a valid booking-invite token regardless of team membership.
+    let viewer_is_member_or_admin = match &optional_auth.user {
+        Some(u) if u.role == "admin" => true,
+        Some(u) => is_team_member(&state.pool, &u.id, &team_id).await,
+        None => false,
+    };
+
     let invite_guest_name;
     let invite_guest_email;
     if visibility == "private" || visibility == "internal" {
@@ -7871,8 +8279,9 @@ async fn show_group_book_form(
                 invite_guest_email = Some(email);
             }
         }
-    } else if team_visibility == "private" {
+    } else if team_visibility == "private" && !viewer_is_member_or_admin {
         // Public event type on a private team — needs the team invite token
+        // unless the viewer is a logged-in team member or global admin.
         let valid = matches!((&team_invite_token, &query.invite), (Some(expected), Some(provided)) if !provided.is_empty() && provided == expected);
         if !valid {
             return Html("Event type not found.".to_string());
@@ -7938,6 +8347,7 @@ async fn show_group_book_form(
 
 async fn handle_group_booking(
     State(state): State<Arc<AppState>>,
+    optional_auth: crate::auth::OptionalAuthUser,
     headers: axum::http::HeaderMap,
     Path((team_slug, slug)): Path<(String, String)>,
     Form(form): Form<BookForm>,
@@ -8035,9 +8445,20 @@ async fn handle_group_booking(
             }
         }
     } else if team_visibility == "private" {
-        let valid = matches!((&team_invite_token, &form.invite_token), (Some(expected), Some(provided)) if !provided.is_empty() && provided == expected);
-        if !valid {
-            return Html("Event type not found.".to_string()).into_response();
+        // Public event on a private team: logged-in team members and global
+        // admins bypass the team invite token requirement (their team
+        // membership is the access). Private/internal events above already
+        // returned, so this branch is public-only.
+        let viewer_is_member_or_admin = match &optional_auth.user {
+            Some(u) if u.role == "admin" => true,
+            Some(u) => is_team_member(&state.pool, &u.id, &team_id).await,
+            None => false,
+        };
+        if !viewer_is_member_or_admin {
+            let valid = matches!((&team_invite_token, &form.invite_token), (Some(expected), Some(provided)) if !provided.is_empty() && provided == expected);
+            if !valid {
+                return Html("Event type not found.".to_string()).into_response();
+            }
         }
     }
 
@@ -8119,10 +8540,15 @@ async fn handle_group_booking(
     };
 
     // Check booking frequency limits
-    if would_exceed_frequency_limit(&state.pool, &et_id, slot_start).await {
+    if would_exceed_frequency_limit(&state.pool, &et_id, slot_start, Some(&assigned_user_id)).await
+    {
         let _ = tx.rollback().await;
-        return Html("This event type has reached its booking limit for this period.".to_string())
-            .into_response();
+        return render_booking_action_error(
+            &state,
+            &headers,
+            "Not available right now",
+            "The host isn't accepting more bookings for this date. Please pick a different date, or check back later.",
+        );
     }
 
     let insert_result = sqlx::query(
@@ -8213,6 +8639,7 @@ async fn handle_group_booking(
         reminder_minutes: reminder_min,
         additional_attendees: additional_attendees.clone(),
         guest_language: Some(lang.to_string()),
+        host_timezone: host_tz.name().to_string(),
         ..Default::default()
     };
 
@@ -8850,10 +9277,16 @@ async fn handle_dynamic_group_booking(
         }
     }
 
-    // Check booking frequency limits
-    if would_exceed_frequency_limit(&state.pool, &et_id, slot_start).await {
-        return Html("This event type has reached its booking limit for this period.".to_string())
-            .into_response();
+    // Check booking frequency limits. The dynamic-group flow doesn't pin a
+    // single assignee on the booking, so per-member caps fall back to
+    // event-type-wide here.
+    if would_exceed_frequency_limit(&state.pool, &et_id, slot_start, None).await {
+        return render_booking_action_error(
+            state,
+            headers,
+            "Not available right now",
+            "The host isn't accepting more bookings for this date. Please pick a different date, or check back later.",
+        );
     }
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -8974,6 +9407,7 @@ async fn handle_dynamic_group_booking(
         reminder_minutes: reminder_min,
         additional_attendees: all_additional.clone(),
         guest_language: Some(lang.to_string()),
+        host_timezone: host_tz.name().to_string(),
         ..Default::default()
     };
 
@@ -9601,11 +10035,16 @@ async fn handle_booking_for_user(
         return Html("This slot is no longer available.".to_string()).into_response();
     }
 
-    // Check booking frequency limits
-    if would_exceed_frequency_limit(&state.pool, &et_id, slot_start).await {
+    // Check booking frequency limits. Personal event-type flows don't have a
+    // team assignee, so per-member caps degrade to event-type-wide here.
+    if would_exceed_frequency_limit(&state.pool, &et_id, slot_start, None).await {
         let _ = tx.rollback().await;
-        return Html("This event type has reached its booking limit for this period.".to_string())
-            .into_response();
+        return render_booking_action_error(
+            &state,
+            &headers,
+            "Not available right now",
+            "The host isn't accepting more bookings for this date. Please pick a different date, or check back later.",
+        );
     }
 
     let insert_result = sqlx::query(
@@ -9704,6 +10143,7 @@ async fn handle_booking_for_user(
             reminder_minutes: reminder_min,
             additional_attendees: additional_attendees.clone(),
             guest_language: Some(lang.to_string()),
+            host_timezone: host_tz.name().to_string(),
             ..Default::default()
         };
 
@@ -9862,6 +10302,18 @@ async fn pick_group_member(
     .await
     .unwrap_or_default();
 
+    // Per-member booking-frequency caps. We exclude any member already at
+    // (or over) their per-period cap so the picker doesn't pick them just to
+    // have the submit-time check reject the booking.
+    let per_member_limits: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT max_bookings, period FROM booking_frequency_limits \
+         WHERE event_type_id = ? AND per_member = 1",
+    )
+    .bind(event_type_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
     let mut available_members = Vec::new();
 
     for (user_id, name, email, weight) in &members {
@@ -9879,9 +10331,38 @@ async fn pick_group_member(
         // returned unconstrained by user_avail_as_busy, matching the slot
         // grid semantics in show_group_slots.
         busy.extend(user_avail_as_busy(pool, user_id, buf_start, buf_end, host_tz).await);
-        if !has_conflict(&busy, buf_start, buf_end) {
-            available_members.push((user_id.clone(), name.clone(), email.clone(), *weight));
+        if has_conflict(&busy, buf_start, buf_end) {
+            continue;
         }
+
+        let mut at_per_member_cap = false;
+        for (max, period) in &per_member_limits {
+            let (rs, re) = frequency_period_range(slot_start, period);
+            let rs_str = rs.format("%Y-%m-%dT%H:%M:%S").to_string();
+            let re_str = re.format("%Y-%m-%dT%H:%M:%S").to_string();
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM bookings \
+                 WHERE event_type_id = ? AND assigned_user_id = ? \
+                 AND status IN ('confirmed', 'pending') \
+                 AND start_at >= ? AND start_at < ?",
+            )
+            .bind(event_type_id)
+            .bind(user_id)
+            .bind(&rs_str)
+            .bind(&re_str)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+            if count >= *max as i64 {
+                at_per_member_cap = true;
+                break;
+            }
+        }
+        if at_per_member_cap {
+            continue;
+        }
+
+        available_members.push((user_id.clone(), name.clone(), email.clone(), *weight));
     }
 
     if available_members.is_empty() {
@@ -10172,6 +10653,12 @@ async fn compute_slots(
         &overrides,
     );
 
+    // Drop slots whose host-local period already meets/exceeds a configured
+    // frequency cap. The submit-time check (would_exceed_frequency_limit)
+    // stays as a backstop for the race where two guests grab the last slot
+    // at the same instant.
+    apply_frequency_limit_filter(pool, et_id, &mut result).await;
+
     // If first_slot_only is enabled, keep only the earliest slot per day
     let first_only: i32 =
         sqlx::query_scalar("SELECT first_slot_only FROM event_types WHERE id = ?")
@@ -10189,7 +10676,136 @@ async fn compute_slots(
     result
 }
 
-/// Save booking frequency limits from the serialized form field ("1:day,5:week").
+/// Remove slots that fall inside a host-local period already at/over a
+/// configured booking-frequency cap, so the picker doesn't surface times
+/// that the submit-time check would reject.
+///
+/// Per-member limits hide a slot only when *every* eligible team member is
+/// already at their cap for the slot's period; if any one of them still has
+/// headroom, the slot stays available and the round-robin picker will route
+/// to that member. On personal event types (no team), per-member limits
+/// degrade to event-type-wide behaviour.
+async fn apply_frequency_limit_filter(pool: &SqlitePool, et_id: &str, days: &mut [SlotDay]) {
+    let limits: Vec<(i32, String, i32)> = sqlx::query_as(
+        "SELECT max_bookings, period, per_member FROM booking_frequency_limits WHERE event_type_id = ?",
+    )
+    .bind(et_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    if limits.is_empty() {
+        return;
+    }
+
+    let has_per_member = limits.iter().any(|(_, _, m)| *m != 0);
+    let team_members: Vec<String> = if has_per_member {
+        sqlx::query_scalar(
+            "SELECT u.id FROM users u \
+             JOIN team_members tm ON tm.user_id = u.id \
+             JOIN event_types et ON et.team_id = tm.team_id \
+             LEFT JOIN event_type_member_weights etw ON etw.user_id = u.id AND etw.event_type_id = et.id \
+             WHERE et.id = ? AND u.enabled = 1 AND COALESCE(etw.weight, 1) > 0",
+        )
+        .bind(et_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Gather unique (period, period_start) pairs the visible slots touch, and
+    // resolve each one to (event-type-wide count, per-member counts).
+    let mut wide_counts: HashMap<(String, NaiveDateTime), i64> = HashMap::new();
+    let mut member_counts: HashMap<(String, NaiveDateTime, String), i64> = HashMap::new();
+
+    for day in days.iter() {
+        for slot in &day.slots {
+            let Ok(d) = NaiveDate::parse_from_str(&slot.host_date, "%Y-%m-%d") else {
+                continue;
+            };
+            let dt = d.and_hms_opt(12, 0, 0).unwrap();
+            for (_, period, _) in &limits {
+                let (ps, _) = frequency_period_range(dt, period);
+                wide_counts.entry((period.clone(), ps)).or_insert(0);
+            }
+        }
+    }
+
+    for ((period, ps), wide) in wide_counts.iter_mut() {
+        let (rs, re) = frequency_period_range(*ps, period);
+        let rs_str = rs.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let re_str = re.format("%Y-%m-%dT%H:%M:%S").to_string();
+
+        let c: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM bookings WHERE event_type_id = ? AND status IN ('confirmed', 'pending') AND start_at >= ? AND start_at < ?",
+        )
+        .bind(et_id)
+        .bind(&rs_str)
+        .bind(&re_str)
+        .fetch_one(pool)
+        .await
+        .unwrap_or((0,));
+        *wide = c.0;
+
+        if has_per_member && !team_members.is_empty() {
+            let rows: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT assigned_user_id, COUNT(*) FROM bookings \
+                 WHERE event_type_id = ? AND assigned_user_id IS NOT NULL \
+                 AND status IN ('confirmed', 'pending') \
+                 AND start_at >= ? AND start_at < ? \
+                 GROUP BY assigned_user_id",
+            )
+            .bind(et_id)
+            .bind(&rs_str)
+            .bind(&re_str)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            for (uid, n) in rows {
+                member_counts.insert((period.clone(), *ps, uid), n);
+            }
+        }
+    }
+
+    for day in days.iter_mut() {
+        day.slots.retain(|slot| {
+            let Ok(d) = NaiveDate::parse_from_str(&slot.host_date, "%Y-%m-%d") else {
+                return true;
+            };
+            let dt = d.and_hms_opt(12, 0, 0).unwrap();
+            for (max, period, per_member) in &limits {
+                let (ps, _) = frequency_period_range(dt, period);
+                let max_i64 = *max as i64;
+                if *per_member != 0 && !team_members.is_empty() {
+                    // Hide only if every eligible member is at cap.
+                    let all_capped = team_members.iter().all(|uid| {
+                        let count = member_counts
+                            .get(&(period.clone(), ps, uid.clone()))
+                            .copied()
+                            .unwrap_or(0);
+                        count >= max_i64
+                    });
+                    if all_capped {
+                        return false;
+                    }
+                } else {
+                    let count = wide_counts.get(&(period.clone(), ps)).copied().unwrap_or(0);
+                    if count >= max_i64 {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+    }
+}
+
+/// Save booking frequency limits from the serialized form field.
+/// Format per row: "count:period" or "count:period:m" (the trailing ":m"
+/// marks the row as per-member; absence means event-type-wide). Rows are
+/// comma-separated.
 async fn save_frequency_limits(pool: &SqlitePool, event_type_id: &str, limits_str: &str) {
     if limits_str.is_empty() {
         return;
@@ -10199,20 +10815,27 @@ async fn save_frequency_limits(pool: &SqlitePool, event_type_id: &str, limits_st
         if part.is_empty() {
             continue;
         }
-        if let Some((count_str, period)) = part.split_once(':') {
-            let count: i32 = count_str.parse().unwrap_or(0);
-            if count > 0 && ["day", "week", "month", "year"].contains(&period) {
-                let limit_id = uuid::Uuid::new_v4().to_string();
-                let _ = sqlx::query(
-                    "INSERT INTO booking_frequency_limits (id, event_type_id, max_bookings, period) VALUES (?, ?, ?, ?)",
-                )
-                .bind(&limit_id)
-                .bind(event_type_id)
-                .bind(count)
-                .bind(period)
-                .execute(pool)
-                .await;
-            }
+        let mut bits = part.splitn(3, ':');
+        let Some(count_str) = bits.next() else {
+            continue;
+        };
+        let Some(period) = bits.next() else {
+            continue;
+        };
+        let per_member = matches!(bits.next(), Some("m"));
+        let count: i32 = count_str.parse().unwrap_or(0);
+        if count > 0 && ["day", "week", "month", "year"].contains(&period) {
+            let limit_id = uuid::Uuid::new_v4().to_string();
+            let _ = sqlx::query(
+                "INSERT INTO booking_frequency_limits (id, event_type_id, max_bookings, period, per_member) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&limit_id)
+            .bind(event_type_id)
+            .bind(count)
+            .bind(period)
+            .bind(per_member as i32)
+            .execute(pool)
+            .await;
         }
     }
 }
@@ -10264,14 +10887,18 @@ fn frequency_period_range(dt: NaiveDateTime, period: &str) -> (NaiveDateTime, Na
     }
 }
 
-/// Check if booking at the given datetime would exceed any frequency limit for the event type.
+/// Check if a booking at the given datetime would exceed any frequency limit
+/// configured on the event type. `assigned_user_id` is the team member the
+/// booking would land on — required for per-member caps; ignored by
+/// event-type-wide caps. Pass `None` for personal event types (no assignee).
 async fn would_exceed_frequency_limit(
     pool: &SqlitePool,
     event_type_id: &str,
     proposed_start: NaiveDateTime,
+    assigned_user_id: Option<&str>,
 ) -> bool {
-    let limits: Vec<(i32, String)> = sqlx::query_as(
-        "SELECT max_bookings, period FROM booking_frequency_limits WHERE event_type_id = ?",
+    let limits: Vec<(i32, String, i32)> = sqlx::query_as(
+        "SELECT max_bookings, period, per_member FROM booking_frequency_limits WHERE event_type_id = ?",
     )
     .bind(event_type_id)
     .fetch_all(pool)
@@ -10282,19 +10909,46 @@ async fn would_exceed_frequency_limit(
         return false;
     }
 
-    for (max_bookings, period) in &limits {
+    for (max_bookings, period, per_member) in &limits {
         let (range_start, range_end) = frequency_period_range(proposed_start, period);
         let range_start_str = range_start.format("%Y-%m-%dT%H:%M:%S").to_string();
         let range_end_str = range_end.format("%Y-%m-%dT%H:%M:%S").to_string();
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM bookings WHERE event_type_id = ? AND status IN ('confirmed', 'pending') AND start_at >= ? AND start_at < ?",
-        )
-        .bind(event_type_id)
-        .bind(&range_start_str)
-        .bind(&range_end_str)
-        .fetch_one(pool)
-        .await
-        .unwrap_or((0,));
+
+        let count: (i64,) = if *per_member != 0 {
+            // A per-member cap on a personal event type (no assignee) is
+            // meaningless — treat it as event-type-wide for those cases.
+            match assigned_user_id {
+                Some(uid) => sqlx::query_as(
+                    "SELECT COUNT(*) FROM bookings WHERE event_type_id = ? AND assigned_user_id = ? AND status IN ('confirmed', 'pending') AND start_at >= ? AND start_at < ?",
+                )
+                .bind(event_type_id)
+                .bind(uid)
+                .bind(&range_start_str)
+                .bind(&range_end_str)
+                .fetch_one(pool)
+                .await
+                .unwrap_or((0,)),
+                None => sqlx::query_as(
+                    "SELECT COUNT(*) FROM bookings WHERE event_type_id = ? AND status IN ('confirmed', 'pending') AND start_at >= ? AND start_at < ?",
+                )
+                .bind(event_type_id)
+                .bind(&range_start_str)
+                .bind(&range_end_str)
+                .fetch_one(pool)
+                .await
+                .unwrap_or((0,)),
+            }
+        } else {
+            sqlx::query_as(
+                "SELECT COUNT(*) FROM bookings WHERE event_type_id = ? AND status IN ('confirmed', 'pending') AND start_at >= ? AND start_at < ?",
+            )
+            .bind(event_type_id)
+            .bind(&range_start_str)
+            .bind(&range_end_str)
+            .fetch_one(pool)
+            .await
+            .unwrap_or((0,))
+        };
 
         if count.0 >= *max_bookings as i64 {
             return true;
@@ -11380,11 +12034,16 @@ async fn handle_booking(
         return Html("This slot is no longer available.".to_string()).into_response();
     }
 
-    // Check booking frequency limits
-    if would_exceed_frequency_limit(&state.pool, &et_id, slot_start).await {
+    // Check booking frequency limits. Personal event-type flows don't have a
+    // team assignee, so per-member caps degrade to event-type-wide here.
+    if would_exceed_frequency_limit(&state.pool, &et_id, slot_start, None).await {
         let _ = tx.rollback().await;
-        return Html("This event type has reached its booking limit for this period.".to_string())
-            .into_response();
+        return render_booking_action_error(
+            &state,
+            &headers,
+            "Not available right now",
+            "The host isn't accepting more bookings for this date. Please pick a different date, or check back later.",
+        );
     }
 
     let insert_result = sqlx::query(
@@ -11467,6 +12126,7 @@ async fn handle_booking(
             reminder_minutes: reminder_min,
             additional_attendees: additional_attendees.clone(),
             guest_language: Some(lang.to_string()),
+            host_timezone: host_tz.name().to_string(),
             ..Default::default()
         };
 
@@ -12292,15 +12952,43 @@ async fn admin_dashboard(
         .unwrap_or_default();
     let google_oauth2_configured = !google_oauth2_client_id.is_empty();
 
-    // Fetch SMTP config (first one found)
-    let smtp: Option<(String, i32, String, bool)> =
-        sqlx::query_as("SELECT host, port, from_email, enabled FROM smtp_config LIMIT 1")
-            .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None);
-
-    let smtp_configured = smtp.is_some();
-    let (smtp_host, smtp_port, smtp_from_email, smtp_enabled) = smtp.unwrap_or_default();
+    let (
+        smtp_configured,
+        smtp_host,
+        smtp_port,
+        smtp_from_email,
+        smtp_enabled,
+        smtp_from_env,
+        smtp_error,
+    ) = match crate::email::load_smtp_status(&state.pool).await {
+        Ok(Some(status)) => (
+            true,
+            status.host,
+            status.port,
+            status.from_email,
+            status.enabled,
+            status.from_env,
+            String::new(),
+        ),
+        Ok(None) => (
+            false,
+            String::new(),
+            0u16,
+            String::new(),
+            false,
+            false,
+            String::new(),
+        ),
+        Err(e) => (
+            false,
+            String::new(),
+            0u16,
+            String::new(),
+            false,
+            true,
+            e.to_string(),
+        ),
+    };
 
     let tmpl = match state.templates.get_template("admin.html") {
         Ok(t) => t,
@@ -12340,6 +13028,8 @@ async fn admin_dashboard(
             smtp_port => smtp_port,
             smtp_from_email => smtp_from_email,
             smtp_enabled => smtp_enabled,
+            smtp_from_env => smtp_from_env,
+            smtp_error => smtp_error,
             has_logo => state.data_dir.join("logo.png").exists(),
             company_link => get_company_link(&state.pool).await.unwrap_or_default(),
             current_theme => get_theme_name(&state.pool).await,
@@ -13342,6 +14032,7 @@ async fn approve_booking_by_token(
         location: location_value,
         reminder_minutes: None,
         additional_attendees: vec![],
+        host_timezone: stored_tz.name().to_string(),
         ..Default::default()
     };
 
@@ -13565,6 +14256,7 @@ async fn decline_booking_by_token(
             uid: String::new(),
             reason: reason.clone(),
             cancelled_by_host: true,
+            host_timezone: stored_tz.name().to_string(),
             ..Default::default()
         };
         let _ = crate::email::send_guest_decline_notice(&smtp_config, &details).await;
@@ -13913,6 +14605,7 @@ async fn guest_cancel_booking(
             // Guest is the one cancelling; their browser language now is the
             // best signal we have (they chose this language to view the form).
             guest_language: Some(lang.to_string()),
+            host_timezone: stored_tz.name().to_string(),
             ..Default::default()
         };
 
@@ -14461,9 +15154,12 @@ async fn guest_reschedule_booking(
             .await
             .unwrap_or_default();
 
-    let old_date = old_start_at.get(..10).unwrap_or(&old_start_at).to_string();
-    let old_start_time = extract_time_24h(&old_start_at);
-    let old_end_time = extract_time_24h(&old_end_at);
+    // old_start_at/old_end_at are stored in the event-type tz. Convert into the
+    // guest's tz so `RescheduleDetails` carries guest-local wall-clock for
+    // both the OLD and NEW times — matches the contract used elsewhere and
+    // lets `host_time_display` correctly recover the host wall-clock.
+    let (old_date, old_start_time, old_end_time) =
+        booking_strings_in_guest_tz(&old_start_at, &old_end_at, host_tz, guest_tz);
 
     if needs_approval {
         // Guest-initiated reschedule on requires_confirmation event → pending.
@@ -14500,6 +15196,7 @@ async fn guest_reschedule_booking(
                 host_email,
                 uid: uid.clone(),
                 location: loc_value.clone(),
+                host_timezone: host_tz.name().to_string(),
             };
             let _ = crate::email::send_host_reschedule_request(
                 &smtp_config,
@@ -14539,6 +15236,7 @@ async fn guest_reschedule_booking(
                 location: loc_value,
                 reminder_minutes: None,
                 additional_attendees: vec![],
+                host_timezone: host_tz.name().to_string(),
                 ..Default::default()
             };
             let _ = crate::email::send_guest_pending_notice_ex(
@@ -14567,6 +15265,7 @@ async fn guest_reschedule_booking(
             location: loc_value.clone(),
             reminder_minutes: None,
             additional_attendees: vec![],
+            host_timezone: host_tz.name().to_string(),
             ..Default::default()
         };
         caldav_push_booking(
@@ -14615,6 +15314,7 @@ async fn guest_reschedule_booking(
                     host_email: host_email.clone(),
                     uid,
                     location: loc_value,
+                    host_timezone: host_tz.name().to_string(),
                 },
                 guest_cancel_url.as_deref(),
                 guest_reschedule_url.as_deref(),
@@ -14731,9 +15431,10 @@ async fn host_reschedule_booking(
         String,
         String,
         String,
+        String,
     )> = sqlx::query_as(
         "SELECT b.id, b.uid, b.guest_name, b.guest_email, b.start_at, b.end_at,
-                    et.title, COALESCE(b.guest_timezone, 'UTC')
+                    et.title, COALESCE(b.guest_timezone, 'UTC'), et.id
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
@@ -14745,7 +15446,7 @@ async fn host_reschedule_booking(
     .await
     .unwrap_or(None);
 
-    let (bid, _uid, guest_name, guest_email, start_at, end_at, event_title, guest_timezone) =
+    let (bid, _uid, guest_name, guest_email, start_at, end_at, event_title, guest_timezone, et_id) =
         match booking {
             Some(b) => b,
             None => return Redirect::to("/dashboard/bookings").into_response(),
@@ -14787,9 +15488,14 @@ async fn host_reschedule_booking(
                         .map(|base| format!("{}/booking/cancel/{}", base.trim_end_matches('/'), t))
                 });
 
-        let date = start_at.get(..10).unwrap_or(&start_at).to_string();
-        let start_time = extract_time_24h(&start_at);
-        let end_time = extract_time_24h(&end_at);
+        // start_at/end_at are stored in the event-type tz (see #101). Convert
+        // into the guest's tz before populating BookingDetails so the
+        // guest-facing "pick new time" email shows their wall-clock with their
+        // tz label.
+        let host_tz = get_host_tz(&state.pool, &et_id).await;
+        let guest_tz_parsed = guest_timezone.parse::<Tz>().unwrap_or(Tz::UTC);
+        let (date, start_time, end_time) =
+            booking_strings_in_guest_tz(&start_at, &end_at, host_tz, guest_tz_parsed);
 
         let details = crate::email::BookingDetails {
             event_title,
@@ -14809,6 +15515,7 @@ async fn host_reschedule_booking(
             location: None,
             reminder_minutes: None,
             additional_attendees: vec![],
+            host_timezone: host_tz.name().to_string(),
             ..Default::default()
         };
 
@@ -15171,7 +15878,7 @@ async fn claim_booking_form(
     let token = match params.get("token") {
         Some(t) => t,
         None => {
-            return render_claim_error(
+            return render_booking_action_error(
                 &state,
                 &headers,
                 "Invalid link",
@@ -15219,7 +15926,7 @@ async fn claim_booking_form(
             .into_response();
         }
 
-        return render_claim_error(
+        return render_booking_action_error(
             &state,
             &headers,
             "Invalid or expired link",
@@ -15243,7 +15950,7 @@ async fn claim_booking_form(
     let (event_title, guest_name, guest_email, start_at, end_at, assigned_to) = match booking {
         Some(b) => b,
         None => {
-            return render_claim_error(
+            return render_booking_action_error(
                 &state,
                 &headers,
                 "Booking not found",
@@ -15336,7 +16043,7 @@ async fn claim_booking(
                 .into_response();
             }
 
-            return render_claim_error(
+            return render_booking_action_error(
                 &state,
                 &headers,
                 "Invalid or expired link",
@@ -15442,11 +16149,11 @@ async fn claim_booking(
         guest_tz,
         host_user_id,
         location,
-        _event_type_id,
+        event_type_id,
     ) = match booking {
         Some(b) => b,
         None => {
-            return render_claim_error(
+            return render_booking_action_error(
                 &state,
                 &headers,
                 "Booking not found",
@@ -15487,6 +16194,8 @@ async fn claim_booking(
         .execute(&state.pool)
         .await;
 
+    let claim_host_tz = get_host_tz(&state.pool, &event_type_id).await;
+
     // Build details with claimant as additional attendee for CalDAV push
     let mut details = crate::email::BookingDetails {
         event_title: event_title.clone(),
@@ -15503,6 +16212,7 @@ async fn claim_booking(
         location,
         reminder_minutes: None,
         additional_attendees: vec![claimant_email.clone()],
+        host_timezone: claim_host_tz.name().to_string(),
         ..Default::default()
     };
 
@@ -15573,7 +16283,7 @@ async fn claim_booking(
     .into_response()
 }
 
-fn render_claim_error(
+fn render_booking_action_error(
     state: &AppState,
     headers: &HeaderMap,
     title: &str,
@@ -15958,6 +16668,237 @@ mod tests {
         (user_id, account_id, et_id)
     }
 
+    // --- Authorization helpers: can_manage_event_type / find_manageable_event_type_by_slug ---
+
+    /// Insert a user with a configurable role. Returns user_id.
+    async fn insert_role_user(pool: &SqlitePool, email: &str, role: &str) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let username = email.split('@').next().unwrap_or("u").to_string();
+        sqlx::query(
+            "INSERT INTO users (id, email, name, role, auth_provider, username, enabled) \
+             VALUES (?, ?, ?, ?, 'local', ?, 1)",
+        )
+        .bind(&id)
+        .bind(email)
+        .bind(email)
+        .bind(role)
+        .bind(&username)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Insert a personal event type owned by `user_id`. Creates the account row
+    /// if missing. Returns event_type_id.
+    async fn insert_personal_et(pool: &SqlitePool, user_id: &str, slug: &str) -> String {
+        let account_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM accounts WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_optional(pool)
+                .await
+                .unwrap();
+        let account_id = match account_id {
+            Some(id) => id,
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                sqlx::query(
+                    "INSERT INTO accounts (id, name, email, timezone, user_id) \
+                     VALUES (?, 'A', 'a@x', 'UTC', ?)",
+                )
+                .bind(&id)
+                .bind(user_id)
+                .execute(pool)
+                .await
+                .unwrap();
+                id
+            }
+        };
+        let et_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO event_types (id, account_id, slug, title, duration_min, buffer_before, buffer_after, min_notice_min, enabled) \
+             VALUES (?, ?, ?, 'P', 30, 0, 0, 0, 1)",
+        )
+        .bind(&et_id)
+        .bind(&account_id)
+        .bind(slug)
+        .execute(pool)
+        .await
+        .unwrap();
+        et_id
+    }
+
+    /// Insert a team and a team event type. `members` is a list of (user_id, role).
+    /// Returns (team_id, event_type_id).
+    async fn insert_team_with_et(
+        pool: &SqlitePool,
+        team_slug: &str,
+        et_slug: &str,
+        members: &[(&str, &str)],
+    ) -> (String, String) {
+        let team_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO teams (id, name, slug, visibility) VALUES (?, ?, ?, 'public')")
+            .bind(&team_id)
+            .bind(team_slug)
+            .bind(team_slug)
+            .execute(pool)
+            .await
+            .unwrap();
+        for (uid, role) in members {
+            sqlx::query(
+                "INSERT INTO team_members (team_id, user_id, role, source) \
+                 VALUES (?, ?, ?, 'direct')",
+            )
+            .bind(&team_id)
+            .bind(uid)
+            .bind(role)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        // Each team event gets its own placeholder account to avoid colliding
+        // with personal events under the unique(account_id, slug) constraint.
+        let account_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO accounts (id, name, email, timezone) VALUES (?, 't', 't@x', 'UTC')",
+        )
+        .bind(&account_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let et_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO event_types (id, account_id, team_id, slug, title, duration_min, buffer_before, buffer_after, min_notice_min, enabled) \
+             VALUES (?, ?, ?, ?, 'T', 30, 0, 0, 0, 1)",
+        )
+        .bind(&et_id)
+        .bind(&account_id)
+        .bind(&team_id)
+        .bind(et_slug)
+        .execute(pool)
+        .await
+        .unwrap();
+        (team_id, et_id)
+    }
+
+    async fn user_for(pool: &SqlitePool, user_id: &str) -> crate::models::User {
+        sqlx::query_as("SELECT * FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn can_manage_event_type_global_admin_yes_for_any_event() {
+        let pool = setup_test_db().await;
+        let admin_id = insert_role_user(&pool, "admin@x", "admin").await;
+        let owner_id = insert_role_user(&pool, "owner@x", "user").await;
+        let personal_et = insert_personal_et(&pool, &owner_id, "personal").await;
+        let (_, team_et) = insert_team_with_et(&pool, "team1", "team-et", &[]).await;
+        let admin = user_for(&pool, &admin_id).await;
+        assert!(can_manage_event_type(&pool, &admin, &personal_et).await);
+        assert!(can_manage_event_type(&pool, &admin, &team_et).await);
+    }
+
+    #[tokio::test]
+    async fn can_manage_event_type_personal_owner_yes_others_no() {
+        let pool = setup_test_db().await;
+        let owner_id = insert_role_user(&pool, "owner@x", "user").await;
+        let other_id = insert_role_user(&pool, "other@x", "user").await;
+        let et = insert_personal_et(&pool, &owner_id, "personal").await;
+        let owner = user_for(&pool, &owner_id).await;
+        let other = user_for(&pool, &other_id).await;
+        assert!(can_manage_event_type(&pool, &owner, &et).await);
+        assert!(!can_manage_event_type(&pool, &other, &et).await);
+    }
+
+    #[tokio::test]
+    async fn can_manage_event_type_team_admin_yes_member_no() {
+        let pool = setup_test_db().await;
+        let admin_id = insert_role_user(&pool, "ta@x", "user").await;
+        let member_id = insert_role_user(&pool, "tm@x", "user").await;
+        let outsider_id = insert_role_user(&pool, "out@x", "user").await;
+        let (_, et) = insert_team_with_et(
+            &pool,
+            "team1",
+            "team-et",
+            &[(&admin_id, "admin"), (&member_id, "member")],
+        )
+        .await;
+        let admin = user_for(&pool, &admin_id).await;
+        let member = user_for(&pool, &member_id).await;
+        let outsider = user_for(&pool, &outsider_id).await;
+        assert!(can_manage_event_type(&pool, &admin, &et).await);
+        assert!(!can_manage_event_type(&pool, &member, &et).await);
+        assert!(!can_manage_event_type(&pool, &outsider, &et).await);
+    }
+
+    #[tokio::test]
+    async fn can_manage_event_type_team_admin_cannot_manage_others_personal_event() {
+        // Being a team admin somewhere does not grant access to an unrelated
+        // user's personal event types.
+        let pool = setup_test_db().await;
+        let team_admin_id = insert_role_user(&pool, "ta@x", "user").await;
+        let stranger_id = insert_role_user(&pool, "s@x", "user").await;
+        let stranger_et = insert_personal_et(&pool, &stranger_id, "p").await;
+        let _ = insert_team_with_et(&pool, "team1", "te", &[(&team_admin_id, "admin")]).await;
+        let team_admin = user_for(&pool, &team_admin_id).await;
+        assert!(!can_manage_event_type(&pool, &team_admin, &stranger_et).await);
+    }
+
+    #[tokio::test]
+    async fn can_manage_event_type_team_member_cannot_manage_others_personal_event() {
+        let pool = setup_test_db().await;
+        let team_member_id = insert_role_user(&pool, "tm@x", "user").await;
+        let stranger_id = insert_role_user(&pool, "s@x", "user").await;
+        let stranger_et = insert_personal_et(&pool, &stranger_id, "p").await;
+        let _ = insert_team_with_et(&pool, "team1", "te", &[(&team_member_id, "member")]).await;
+        let team_member = user_for(&pool, &team_member_id).await;
+        assert!(!can_manage_event_type(&pool, &team_member, &stranger_et).await);
+    }
+
+    #[tokio::test]
+    async fn can_manage_event_type_personal_owner_cannot_manage_unrelated_team_event() {
+        let pool = setup_test_db().await;
+        // Owner of a personal event with the same slug as some team event —
+        // owning the personal event must not grant access to the team one.
+        let owner_id = insert_role_user(&pool, "owner@x", "user").await;
+        let _ = insert_personal_et(&pool, &owner_id, "demo").await;
+        let (_, team_et) = insert_team_with_et(&pool, "team1", "demo", &[]).await;
+        let owner = user_for(&pool, &owner_id).await;
+        assert!(!can_manage_event_type(&pool, &owner, &team_et).await);
+    }
+
+    #[tokio::test]
+    async fn find_manageable_event_type_by_slug_personal_wins_collision() {
+        // If the user has both a personal event and a team-admin event sharing
+        // the same slug, the personal event must resolve first (deterministic).
+        let pool = setup_test_db().await;
+        let user_id = insert_role_user(&pool, "u@x", "user").await;
+        let personal_et = insert_personal_et(&pool, &user_id, "demo").await;
+        let (_, team_et) =
+            insert_team_with_et(&pool, "team1", "demo", &[(&user_id, "admin")]).await;
+        let resolved = find_manageable_event_type_by_slug(&pool, &user_id, "demo")
+            .await
+            .expect("should resolve");
+        assert_eq!(resolved.0, personal_et);
+        assert_ne!(resolved.0, team_et);
+        assert!(resolved.2.is_none(), "personal event has no team_id");
+    }
+
+    #[tokio::test]
+    async fn find_manageable_event_type_by_slug_member_does_not_resolve() {
+        // Regular team members should not resolve team event types via this
+        // helper — only team admins do.
+        let pool = setup_test_db().await;
+        let user_id = insert_role_user(&pool, "m@x", "user").await;
+        let _ = insert_team_with_et(&pool, "team1", "demo", &[(&user_id, "member")]).await;
+        assert!(find_manageable_event_type_by_slug(&pool, &user_id, "demo")
+            .await
+            .is_none());
+    }
+
     #[tokio::test]
     async fn fetch_busy_times_empty_calendar() {
         let pool = setup_test_db().await;
@@ -16167,6 +17108,665 @@ mod tests {
             slot_times.contains(&"09:00"),
             "09:00 should be free (no buffer overlap)"
         );
+    }
+
+    #[tokio::test]
+    async fn compute_slots_frequency_limit_per_day_drops_capped_day() {
+        let pool = setup_test_db().await;
+        let (_, _, et_id) = seed_test_data(&pool).await;
+
+        let now = Utc::now().with_timezone(&Tz::UTC).naive_local();
+        let mut next_monday = now.date() + Duration::days(1);
+        while next_monday.weekday() != chrono::Weekday::Mon {
+            next_monday += Duration::days(1);
+        }
+        let days_to_monday = (next_monday - now.date()).num_days() as i32;
+
+        sqlx::query("INSERT INTO booking_frequency_limits (id, event_type_id, max_bookings, period) VALUES (?, ?, 1, 'day')")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .execute(&pool).await.unwrap();
+
+        let start_at = next_monday
+            .and_hms_opt(10, 0, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        let end_at = next_monday
+            .and_hms_opt(10, 30, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        sqlx::query("INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token) VALUES (?, ?, 'uid1', 'Guest', 'g@e.com', 'UTC', ?, ?, 'confirmed', ?, ?)")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .bind(&start_at)
+            .bind(&end_at)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(uuid::Uuid::new_v4().to_string())
+            .execute(&pool).await.unwrap();
+
+        let slot_days = compute_slots(
+            &pool,
+            &et_id,
+            30,
+            0,
+            0,
+            0,
+            days_to_monday,
+            5,
+            Tz::UTC,
+            Tz::UTC,
+            BusySource::Individual(vec![]),
+        )
+        .await;
+
+        let monday_date = next_monday.format("%Y-%m-%d").to_string();
+        let monday = slot_days.iter().find(|d| d.date == monday_date);
+        assert!(
+            monday.map(|d| d.slots.is_empty()).unwrap_or(true),
+            "1/day cap reached → Monday should expose no slots, got {:?}",
+            monday.map(|d| d.slots.len())
+        );
+
+        let tuesday_date = (next_monday + Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let tuesday = slot_days
+            .iter()
+            .find(|d| d.date == tuesday_date)
+            .expect("Tuesday should be present");
+        assert_eq!(
+            tuesday.slots.len(),
+            16,
+            "Tuesday is unaffected by Monday's per-day cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_slots_frequency_limit_per_week_drops_whole_week() {
+        let pool = setup_test_db().await;
+        let (_, _, et_id) = seed_test_data(&pool).await;
+
+        let now = Utc::now().with_timezone(&Tz::UTC).naive_local();
+        let mut next_monday = now.date() + Duration::days(1);
+        while next_monday.weekday() != chrono::Weekday::Mon {
+            next_monday += Duration::days(1);
+        }
+        let days_to_monday = (next_monday - now.date()).num_days() as i32;
+
+        sqlx::query("INSERT INTO booking_frequency_limits (id, event_type_id, max_bookings, period) VALUES (?, ?, 1, 'week')")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .execute(&pool).await.unwrap();
+
+        // One booking on Monday consumes the week's only slot.
+        let start_at = next_monday
+            .and_hms_opt(10, 0, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        let end_at = next_monday
+            .and_hms_opt(10, 30, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        sqlx::query("INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token) VALUES (?, ?, 'uid1', 'Guest', 'g@e.com', 'UTC', ?, ?, 'confirmed', ?, ?)")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .bind(&start_at)
+            .bind(&end_at)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(uuid::Uuid::new_v4().to_string())
+            .execute(&pool).await.unwrap();
+
+        let slot_days = compute_slots(
+            &pool,
+            &et_id,
+            30,
+            0,
+            0,
+            0,
+            days_to_monday,
+            5,
+            Tz::UTC,
+            Tz::UTC,
+            BusySource::Individual(vec![]),
+        )
+        .await;
+
+        for day in &slot_days {
+            assert!(
+                day.slots.is_empty(),
+                "Per-week cap of 1 reached → {} should have no slots, got {}",
+                day.date,
+                day.slots.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compute_slots_frequency_limit_ignores_cancelled_bookings() {
+        // Regression: cancelled bookings must not count toward the cap. If they
+        // did, hosts who frequently cancel would silently shrink their own
+        // availability.
+        let pool = setup_test_db().await;
+        let (_, _, et_id) = seed_test_data(&pool).await;
+
+        let now = Utc::now().with_timezone(&Tz::UTC).naive_local();
+        let mut next_monday = now.date() + Duration::days(1);
+        while next_monday.weekday() != chrono::Weekday::Mon {
+            next_monday += Duration::days(1);
+        }
+        let days_to_monday = (next_monday - now.date()).num_days() as i32;
+
+        sqlx::query("INSERT INTO booking_frequency_limits (id, event_type_id, max_bookings, period) VALUES (?, ?, 1, 'day')")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .execute(&pool).await.unwrap();
+
+        // Single cancelled booking on Monday — should not consume the day's cap.
+        let start_at = next_monday
+            .and_hms_opt(10, 0, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        let end_at = next_monday
+            .and_hms_opt(10, 30, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        sqlx::query("INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token) VALUES (?, ?, 'uid1', 'Guest', 'g@e.com', 'UTC', ?, ?, 'cancelled', ?, ?)")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .bind(&start_at)
+            .bind(&end_at)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(uuid::Uuid::new_v4().to_string())
+            .execute(&pool).await.unwrap();
+
+        let slot_days = compute_slots(
+            &pool,
+            &et_id,
+            30,
+            0,
+            0,
+            0,
+            days_to_monday,
+            1,
+            Tz::UTC,
+            Tz::UTC,
+            BusySource::Individual(vec![]),
+        )
+        .await;
+
+        let monday_date = next_monday.format("%Y-%m-%d").to_string();
+        let monday = slot_days
+            .iter()
+            .find(|d| d.date == monday_date)
+            .expect("Monday should be present");
+        assert_eq!(
+            monday.slots.len(),
+            16,
+            "Cancelled bookings must not consume the day cap; expected full 16 slots, got {}",
+            monday.slots.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_slots_frequency_limit_multiple_caps_each_checked() {
+        // Configure both a 1/day and a 100/year cap. With one booking on
+        // Monday only the day cap fires, so Monday must be hidden but
+        // Tue–Fri must stay visible. This pins that the filter consults every
+        // configured limit independently rather than stopping at the first.
+        let pool = setup_test_db().await;
+        let (_, _, et_id) = seed_test_data(&pool).await;
+
+        let now = Utc::now().with_timezone(&Tz::UTC).naive_local();
+        let mut next_monday = now.date() + Duration::days(1);
+        while next_monday.weekday() != chrono::Weekday::Mon {
+            next_monday += Duration::days(1);
+        }
+        let days_to_monday = (next_monday - now.date()).num_days() as i32;
+
+        sqlx::query("INSERT INTO booking_frequency_limits (id, event_type_id, max_bookings, period) VALUES (?, ?, 1, 'day')")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO booking_frequency_limits (id, event_type_id, max_bookings, period) VALUES (?, ?, 100, 'year')")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .execute(&pool).await.unwrap();
+
+        let start_at = next_monday
+            .and_hms_opt(10, 0, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        let end_at = next_monday
+            .and_hms_opt(10, 30, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        sqlx::query("INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token) VALUES (?, ?, 'uid1', 'Guest', 'g@e.com', 'UTC', ?, ?, 'confirmed', ?, ?)")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .bind(&start_at)
+            .bind(&end_at)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(uuid::Uuid::new_v4().to_string())
+            .execute(&pool).await.unwrap();
+
+        let slot_days = compute_slots(
+            &pool,
+            &et_id,
+            30,
+            0,
+            0,
+            0,
+            days_to_monday,
+            5,
+            Tz::UTC,
+            Tz::UTC,
+            BusySource::Individual(vec![]),
+        )
+        .await;
+
+        let monday_date = next_monday.format("%Y-%m-%d").to_string();
+        let monday = slot_days.iter().find(|d| d.date == monday_date);
+        assert!(
+            monday.map(|d| d.slots.is_empty()).unwrap_or(true),
+            "1/day cap should hide Monday even with a lax year cap, got {:?}",
+            monday.map(|d| d.slots.len())
+        );
+
+        let tuesday_date = (next_monday + Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let tuesday = slot_days
+            .iter()
+            .find(|d| d.date == tuesday_date)
+            .expect("Tuesday should be present");
+        assert_eq!(
+            tuesday.slots.len(),
+            16,
+            "Year cap not reached → Tuesday must stay visible"
+        );
+    }
+
+    /// Attach the seeded event type to a team and add two team members
+    /// (alice, bob). Returns their user ids.
+    async fn seed_team_for_event_type(pool: &SqlitePool, et_id: &str) -> (String, String) {
+        let team_id = uuid::Uuid::new_v4().to_string();
+        let alice = uuid::Uuid::new_v4().to_string();
+        let bob = uuid::Uuid::new_v4().to_string();
+
+        sqlx::query(
+            "INSERT INTO teams (id, name, slug, visibility) VALUES (?, 'Team', 'team', 'public')",
+        )
+        .bind(&team_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE event_types SET team_id = ? WHERE id = ?")
+            .bind(&team_id)
+            .bind(et_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username, enabled) VALUES (?, 'alice@example.com', 'Alice', 'user', 'local', 'alice', 1)")
+            .bind(&alice).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username, enabled) VALUES (?, 'bob@example.com', 'Bob', 'user', 'local', 'bob', 1)")
+            .bind(&bob).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO team_members (team_id, user_id, role, source) VALUES (?, ?, 'member', 'direct')")
+            .bind(&team_id).bind(&alice).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO team_members (team_id, user_id, role, source) VALUES (?, ?, 'member', 'direct')")
+            .bind(&team_id).bind(&bob).execute(pool).await.unwrap();
+
+        (alice, bob)
+    }
+
+    async fn insert_booking(
+        pool: &SqlitePool,
+        et_id: &str,
+        assigned_user_id: Option<&str>,
+        start: NaiveDateTime,
+        status: &str,
+    ) {
+        let end = start + Duration::minutes(30);
+        sqlx::query("INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token, assigned_user_id) VALUES (?, ?, ?, 'G', 'g@e.com', 'UTC', ?, ?, ?, ?, ?, ?)")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(et_id)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(start.format("%Y-%m-%dT%H:%M:%S").to_string())
+            .bind(end.format("%Y-%m-%dT%H:%M:%S").to_string())
+            .bind(status)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(assigned_user_id)
+            .execute(pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn would_exceed_frequency_limit_per_member_blocks_only_named_assignee() {
+        let pool = setup_test_db().await;
+        let (_, _, et_id) = seed_test_data(&pool).await;
+        let (alice, bob) = seed_team_for_event_type(&pool, &et_id).await;
+
+        sqlx::query("INSERT INTO booking_frequency_limits (id, event_type_id, max_bookings, period, per_member) VALUES (?, ?, 1, 'day', 1)")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .execute(&pool).await.unwrap();
+
+        let booked_day = NaiveDate::from_ymd_opt(2026, 3, 16).unwrap();
+        let booked_start = booked_day.and_hms_opt(10, 0, 0).unwrap();
+        insert_booking(&pool, &et_id, Some(&alice), booked_start, "confirmed").await;
+
+        let proposed = booked_day.and_hms_opt(14, 0, 0).unwrap();
+        assert!(
+            would_exceed_frequency_limit(&pool, &et_id, proposed, Some(&alice)).await,
+            "Alice already has one booking that day under 1/day per-member"
+        );
+        assert!(
+            !would_exceed_frequency_limit(&pool, &et_id, proposed, Some(&bob)).await,
+            "Bob has zero bookings; per-member cap should not block him"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_frequency_limit_filter_per_member_keeps_slots_when_one_member_free() {
+        // 1/day per-member, 2 team members, 1 booking on Monday assigned to
+        // Alice → Monday must still show slots because Bob has headroom.
+        let pool = setup_test_db().await;
+        let (_, _, et_id) = seed_test_data(&pool).await;
+        let (alice, _bob) = seed_team_for_event_type(&pool, &et_id).await;
+
+        let now = Utc::now().with_timezone(&Tz::UTC).naive_local();
+        let mut next_monday = now.date() + Duration::days(1);
+        while next_monday.weekday() != chrono::Weekday::Mon {
+            next_monday += Duration::days(1);
+        }
+        let days_to_monday = (next_monday - now.date()).num_days() as i32;
+
+        sqlx::query("INSERT INTO booking_frequency_limits (id, event_type_id, max_bookings, period, per_member) VALUES (?, ?, 1, 'day', 1)")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .execute(&pool).await.unwrap();
+        insert_booking(
+            &pool,
+            &et_id,
+            Some(&alice),
+            next_monday.and_hms_opt(10, 0, 0).unwrap(),
+            "confirmed",
+        )
+        .await;
+
+        let slot_days = compute_slots(
+            &pool,
+            &et_id,
+            30,
+            0,
+            0,
+            0,
+            days_to_monday,
+            1,
+            Tz::UTC,
+            Tz::UTC,
+            BusySource::Individual(vec![]),
+        )
+        .await;
+
+        let monday_date = next_monday.format("%Y-%m-%d").to_string();
+        let monday = slot_days
+            .iter()
+            .find(|d| d.date == monday_date)
+            .expect("Monday should be present");
+        assert_eq!(
+            monday.slots.len(),
+            16,
+            "Per-member cap consumed by Alice must not hide slots while Bob is free"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_frequency_limit_filter_per_member_drops_slots_when_all_members_capped() {
+        // 1/day per-member, 2 team members, both already booked on Monday →
+        // Monday must show no slots.
+        let pool = setup_test_db().await;
+        let (_, _, et_id) = seed_test_data(&pool).await;
+        let (alice, bob) = seed_team_for_event_type(&pool, &et_id).await;
+
+        let now = Utc::now().with_timezone(&Tz::UTC).naive_local();
+        let mut next_monday = now.date() + Duration::days(1);
+        while next_monday.weekday() != chrono::Weekday::Mon {
+            next_monday += Duration::days(1);
+        }
+        let days_to_monday = (next_monday - now.date()).num_days() as i32;
+
+        sqlx::query("INSERT INTO booking_frequency_limits (id, event_type_id, max_bookings, period, per_member) VALUES (?, ?, 1, 'day', 1)")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .execute(&pool).await.unwrap();
+        insert_booking(
+            &pool,
+            &et_id,
+            Some(&alice),
+            next_monday.and_hms_opt(10, 0, 0).unwrap(),
+            "confirmed",
+        )
+        .await;
+        insert_booking(
+            &pool,
+            &et_id,
+            Some(&bob),
+            next_monday.and_hms_opt(11, 0, 0).unwrap(),
+            "confirmed",
+        )
+        .await;
+
+        let slot_days = compute_slots(
+            &pool,
+            &et_id,
+            30,
+            0,
+            0,
+            0,
+            days_to_monday,
+            1,
+            Tz::UTC,
+            Tz::UTC,
+            BusySource::Individual(vec![]),
+        )
+        .await;
+
+        let monday_date = next_monday.format("%Y-%m-%d").to_string();
+        let monday = slot_days.iter().find(|d| d.date == monday_date);
+        assert!(
+            monday.map(|d| d.slots.is_empty()).unwrap_or(true),
+            "Every team member at cap → Monday must be empty, got {:?}",
+            monday.map(|d| d.slots.len())
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_frequency_limit_filter_per_member_on_personal_event_type_degrades_to_wide() {
+        // Personal event type (no team) with a per_member flag set. With no
+        // team members to scope by, the cap should behave event-type-wide so
+        // a single booking still hides the day.
+        let pool = setup_test_db().await;
+        let (_, _, et_id) = seed_test_data(&pool).await;
+
+        let now = Utc::now().with_timezone(&Tz::UTC).naive_local();
+        let mut next_monday = now.date() + Duration::days(1);
+        while next_monday.weekday() != chrono::Weekday::Mon {
+            next_monday += Duration::days(1);
+        }
+        let days_to_monday = (next_monday - now.date()).num_days() as i32;
+
+        sqlx::query("INSERT INTO booking_frequency_limits (id, event_type_id, max_bookings, period, per_member) VALUES (?, ?, 1, 'day', 1)")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .execute(&pool).await.unwrap();
+        insert_booking(
+            &pool,
+            &et_id,
+            None,
+            next_monday.and_hms_opt(10, 0, 0).unwrap(),
+            "confirmed",
+        )
+        .await;
+
+        let slot_days = compute_slots(
+            &pool,
+            &et_id,
+            30,
+            0,
+            0,
+            0,
+            days_to_monday,
+            1,
+            Tz::UTC,
+            Tz::UTC,
+            BusySource::Individual(vec![]),
+        )
+        .await;
+
+        let monday_date = next_monday.format("%Y-%m-%d").to_string();
+        let monday = slot_days.iter().find(|d| d.date == monday_date);
+        assert!(
+            monday.map(|d| d.slots.is_empty()).unwrap_or(true),
+            "Per-member flag on a personal event type must still cap the day"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_frequency_limit_filter_mixed_per_member_and_wide_fire_independently() {
+        // Two limits on the same team event type:
+        //   - 1/day per-member
+        //   - 3/week event-type-wide
+        //
+        // Bookings span two consecutive weeks:
+        //   Week 1: three bookings by Alice on Mon/Tue/Wed → wide week count
+        //           hits its cap (3/3).
+        //   Week 2: one booking each by Alice and Bob on Monday → both
+        //           per-member day caps fill, wide week count is 2/3 (lax).
+        //
+        // Expectations:
+        //   - Every weekday in week 1 must be hidden — wide cap dominates,
+        //     even Thu/Fri where per-member alone would still allow bookings.
+        //   - Week 2 Monday must be hidden by the per-member rule (both
+        //     members at cap) while the wide rule still has headroom.
+        //   - Week 2 Tue-Fri must be visible — neither rule fires.
+        //
+        // If a future change ever conflates the two rule paths, this test
+        // will fail in a specific weekday rather than silently allow or
+        // deny everything.
+        let pool = setup_test_db().await;
+        let (_, _, et_id) = seed_test_data(&pool).await;
+        let (alice, bob) = seed_team_for_event_type(&pool, &et_id).await;
+
+        let now = Utc::now().with_timezone(&Tz::UTC).naive_local();
+        let mut next_monday = now.date() + Duration::days(1);
+        while next_monday.weekday() != chrono::Weekday::Mon {
+            next_monday += Duration::days(1);
+        }
+        let days_to_monday = (next_monday - now.date()).num_days() as i32;
+
+        sqlx::query("INSERT INTO booking_frequency_limits (id, event_type_id, max_bookings, period, per_member) VALUES (?, ?, 1, 'day', 1)")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO booking_frequency_limits (id, event_type_id, max_bookings, period, per_member) VALUES (?, ?, 3, 'week', 0)")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .execute(&pool).await.unwrap();
+
+        // Week 1: three Alice bookings consume the wide week cap.
+        for offset in 0..3 {
+            insert_booking(
+                &pool,
+                &et_id,
+                Some(&alice),
+                (next_monday + Duration::days(offset))
+                    .and_hms_opt(10, 0, 0)
+                    .unwrap(),
+                "confirmed",
+            )
+            .await;
+        }
+
+        // Week 2 Monday: both members booked, capping per-member.
+        let week2_monday = next_monday + Duration::days(7);
+        insert_booking(
+            &pool,
+            &et_id,
+            Some(&alice),
+            week2_monday.and_hms_opt(10, 0, 0).unwrap(),
+            "confirmed",
+        )
+        .await;
+        insert_booking(
+            &pool,
+            &et_id,
+            Some(&bob),
+            week2_monday.and_hms_opt(11, 0, 0).unwrap(),
+            "confirmed",
+        )
+        .await;
+
+        let slot_days = compute_slots(
+            &pool,
+            &et_id,
+            30,
+            0,
+            0,
+            0,
+            days_to_monday,
+            14,
+            Tz::UTC,
+            Tz::UTC,
+            BusySource::Individual(vec![]),
+        )
+        .await;
+
+        let find_day = |d: NaiveDate| -> Option<&SlotDay> {
+            let key = d.format("%Y-%m-%d").to_string();
+            slot_days.iter().find(|x| x.date == key)
+        };
+
+        // Week 1 Mon-Fri: every weekday hidden because the wide cap is hit.
+        for offset in 0..5 {
+            let d = next_monday + Duration::days(offset);
+            let day = find_day(d);
+            assert!(
+                day.map(|x| x.slots.is_empty()).unwrap_or(true),
+                "Week 1 {} should be hidden by the 3/week wide cap; got {:?}",
+                d,
+                day.map(|x| x.slots.len())
+            );
+        }
+
+        // Week 2 Mon: per-member dominates — wide is lax (2/3) but both
+        // members are at their per-day cap.
+        let w2_mon = find_day(week2_monday);
+        assert!(
+            w2_mon.map(|x| x.slots.is_empty()).unwrap_or(true),
+            "Week 2 Monday should be hidden by per-member rule; got {:?}",
+            w2_mon.map(|x| x.slots.len())
+        );
+
+        // Week 2 Tue-Fri: neither rule fires, full availability.
+        for offset in 1..5 {
+            let d = week2_monday + Duration::days(offset);
+            let day = find_day(d).expect("Week 2 weekday should be present");
+            assert_eq!(
+                day.slots.len(),
+                16,
+                "Week 2 {} should be free; got {} slots",
+                d,
+                day.slots.len()
+            );
+        }
     }
 
     #[tokio::test]
@@ -17381,8 +18981,12 @@ mod tests {
     /// `cargo test`. Skip those tests under coverage rather than ship a
     /// red CI job, but keep them live everywhere else so the contract is
     /// still enforced.
+    ///
+    /// Detection uses `cfg!(tarpaulin)` since cargo-tarpaulin compiles with
+    /// `--cfg=tarpaulin`. An earlier attempt keyed off `CARGO_TARPAULIN_VERSION`
+    /// but tarpaulin never sets that env var, so the guard never fired.
     fn under_tarpaulin() -> bool {
-        std::env::var_os("CARGO_TARPAULIN_VERSION").is_some()
+        cfg!(tarpaulin)
     }
 
     #[test]
@@ -19680,6 +21284,170 @@ mod tests {
         assert_eq!(response.status(), 200);
     }
 
+    /// Helper for the source-edit tests: insert a caldav source for the test user.
+    /// Returns the source id. Encrypts with the all-zeroes test secret_key so
+    /// the update handler's decrypt-on-keep-existing path works. Uses
+    /// `example.com` which has public DNS, so `validate_caldav_url` (which does
+    /// DNS resolution to check for SSRF) doesn't fail in the test sandbox.
+    async fn seed_source(pool: &SqlitePool, name: &str, password: &str) -> String {
+        let account_id: (String,) = sqlx::query_as(
+            "SELECT id FROM accounts WHERE user_id = (SELECT id FROM users WHERE username = 'testuser') LIMIT 1",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let enc = crate::crypto::encrypt_password(&[0u8; 32], password).unwrap();
+        sqlx::query(
+            "INSERT INTO caldav_sources (id, account_id, name, url, username, password_enc) VALUES (?, ?, ?, 'https://example.com/dav/old/', 'olduser', ?)",
+        )
+        .bind(&id)
+        .bind(&account_id.0)
+        .bind(name)
+        .bind(&enc)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn edit_source_form_renders_prefilled() {
+        let (app, pool, session, _) = setup_test_app().await;
+        let sid = seed_source(&pool, "My Source", "old-pw").await;
+
+        let response = app
+            .oneshot(get_authed(
+                &format!("/dashboard/sources/{}/edit", sid),
+                &session,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = body_string(response).await;
+        assert!(
+            body.contains("Edit calendar source"),
+            "should render in editing mode"
+        );
+        assert!(body.contains("My Source"), "name pre-filled");
+        // minijinja escapes '/' as '&#x2f;' in attribute values; check both the
+        // host and a path segment (which won't include slashes).
+        assert!(body.contains("example.com"), "url host pre-filled");
+        assert!(
+            body.contains("dav") && body.contains("old"),
+            "url path pre-filled"
+        );
+        assert!(body.contains("olduser"), "username pre-filled");
+        assert!(
+            body.contains("Leave blank to keep existing"),
+            "password placeholder"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_source_changes_fields_and_keeps_password_when_blank() {
+        let (app, pool, session, _) = setup_test_app().await;
+        let sid = seed_source(&pool, "My Source", "old-pw").await;
+
+        let csrf = "test-csrf-update-source";
+        let body = format!(
+            "_csrf={}&name=Renamed&url=https%3A%2F%2Fexample.com%2Fdav%2Fnew%2F&username=newuser&password=&no_test=on",
+            csrf
+        );
+        let response = app
+            .oneshot(post_form(
+                &format!("/dashboard/sources/{}/edit", sid),
+                &session,
+                csrf,
+                &body,
+            ))
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection() || response.status() == 200);
+
+        let row: (String, String, String, String) = sqlx::query_as(
+            "SELECT name, url, username, password_enc FROM caldav_sources WHERE id = ?",
+        )
+        .bind(&sid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "Renamed");
+        assert_eq!(row.1, "https://example.com/dav/new/");
+        assert_eq!(row.2, "newuser");
+        // Decrypt the stored blob and confirm the password is unchanged.
+        let pw = crate::crypto::decrypt_password(&[0u8; 32], &row.3).unwrap();
+        assert_eq!(pw, "old-pw", "blank password must keep the existing one");
+    }
+
+    #[tokio::test]
+    async fn update_source_rotates_password() {
+        let (app, pool, session, _) = setup_test_app().await;
+        let sid = seed_source(&pool, "My Source", "old-pw").await;
+
+        let csrf = "test-csrf-rotate";
+        let body = format!(
+            "_csrf={}&name=My+Source&url=https%3A%2F%2Fexample.com%2Fdav%2Fold%2F&username=olduser&password=new-pw-rotated&no_test=on",
+            csrf
+        );
+        let response = app
+            .oneshot(post_form(
+                &format!("/dashboard/sources/{}/edit", sid),
+                &session,
+                csrf,
+                &body,
+            ))
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection() || response.status() == 200);
+
+        let enc: (String,) = sqlx::query_as("SELECT password_enc FROM caldav_sources WHERE id = ?")
+            .bind(&sid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let pw = crate::crypto::decrypt_password(&[0u8; 32], &enc.0).unwrap();
+        assert_eq!(
+            pw, "new-pw-rotated",
+            "non-blank password must replace the existing one"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_source_404_for_other_user_source() {
+        // The edit handler must scope by user_id; trying to edit a source the
+        // current user doesn't own should redirect away (not leak/edit).
+        let (app, pool, session, _) = setup_test_app().await;
+
+        // Insert an account belonging to a *different* user, and a source under it.
+        let other_user_id = uuid::Uuid::new_v4().to_string();
+        let other_account_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username, enabled) VALUES (?, 'other@example.com', 'Other', 'user', 'local', 'otheruser', 1)")
+            .bind(&other_user_id)
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO accounts (id, name, email, timezone, user_id) VALUES (?, 'Other', 'other@example.com', 'UTC', ?)")
+            .bind(&other_account_id)
+            .bind(&other_user_id)
+            .execute(&pool).await.unwrap();
+        let other_sid = uuid::Uuid::new_v4().to_string();
+        let enc = crate::crypto::encrypt_password(&[0u8; 32], "secret").unwrap();
+        sqlx::query("INSERT INTO caldav_sources (id, account_id, name, url, username, password_enc) VALUES (?, ?, 'Other source', 'https://other.example.com/', 'someone', ?)")
+            .bind(&other_sid)
+            .bind(&other_account_id)
+            .bind(&enc)
+            .execute(&pool).await.unwrap();
+
+        let response = app
+            .oneshot(get_authed(
+                &format!("/dashboard/sources/{}/edit", other_sid),
+                &session,
+            ))
+            .await
+            .unwrap();
+        // Handler redirects to /dashboard/sources for unauthorised access.
+        assert!(response.status().is_redirection());
+    }
+
     // --- Event type CRUD ---
 
     #[tokio::test]
@@ -21680,6 +23448,42 @@ mod tests {
             .and_hms_opt(10, 30, 0)
             .unwrap();
         assert_eq!(guest_to_host_local(dt, tz, tz), dt);
+    }
+
+    // End-to-end TZ pipeline used by background email paths (reminder loop,
+    // reschedule): `start_at` is stored in the event-type tz, must be converted
+    // to the guest tz to populate BookingDetails, and host_time_display must
+    // recover the host wall-clock for host-targeted emails. Regression for the
+    // reviewer-caught bug where the reminder loop short-circuited the first
+    // conversion and the host email displayed times in the wrong zone.
+    #[test]
+    fn stored_to_host_email_recovers_host_wall_clock() {
+        // Scenario from issue #119: Paris event type, LA guest, booked at
+        // what the guest saw as 07:00 LA = 16:00 Paris. start_at stored as
+        // Paris wall-clock.
+        let stored_start = "2026-05-26T16:00:00";
+        let stored_end = "2026-05-26T16:30:00";
+        let host_tz: Tz = "Europe/Paris".parse().unwrap();
+        let guest_tz: Tz = "America/Los_Angeles".parse().unwrap();
+
+        // Step 1: convert stored (host) -> guest wall-clock, as the reminder
+        // loop and reschedule handler now do before building BookingDetails.
+        let (date, start_time, end_time) =
+            booking_strings_in_guest_tz(stored_start, stored_end, host_tz, guest_tz);
+        assert_eq!(date, "2026-05-26");
+        assert_eq!(start_time, "07:00");
+        assert_eq!(end_time, "07:30");
+
+        // Step 2: host_time_display converts guest wall-clock back to host.
+        let (host_date, time_display) = crate::email::host_time_display(
+            &date,
+            &start_time,
+            &end_time,
+            guest_tz.name(),
+            host_tz.name(),
+        );
+        assert_eq!(host_date, "2026-05-26");
+        assert_eq!(time_display, "16:00 \u{2013} 16:30 (Europe/Paris)");
     }
 
     #[test]

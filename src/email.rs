@@ -1,9 +1,9 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::NaiveDateTime;
 use chrono_tz::Tz;
 use fluent_bundle::{FluentArgs, FluentValue};
 use lettre::message::header::ContentType;
-use lettre::message::{Attachment, MultiPart, SinglePart};
+use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use sqlx::SqlitePool;
@@ -40,6 +40,58 @@ pub struct SmtpConfig {
     pub password: String,
     pub from_email: String,
     pub from_name: Option<String>,
+    pub tls_mode: SmtpTlsMode,
+}
+
+impl std::fmt::Debug for SmtpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SmtpConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("from_email", &self.from_email)
+            .field("from_name", &self.from_name)
+            .field("tls_mode", &self.tls_mode)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SmtpTlsMode {
+    StartTls,
+    Tls,
+}
+
+impl SmtpTlsMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "starttls" => Ok(Self::StartTls),
+            "tls" => Ok(Self::Tls),
+            other => bail!(
+                "CALRS_SMTP_TLS_MODE must be 'starttls' or 'tls' (got '{}')",
+                other
+            ),
+        }
+    }
+}
+
+pub struct SmtpStatus {
+    pub host: String,
+    pub port: u16,
+    pub from_email: String,
+    pub enabled: bool,
+    pub from_env: bool,
+}
+
+impl SmtpConfig {
+    /// Get "from" Mailbox, compliant with RFC 5322
+    fn mailbox_from(&self) -> Result<Mailbox> {
+        Ok(Mailbox::new(
+            self.from_name.clone(),
+            self.from_email.parse()?,
+        ))
+    }
 }
 
 #[derive(Clone, Default)]
@@ -64,6 +116,11 @@ pub struct BookingDetails {
     /// Host's saved UI-language preference (from `users.language`).
     /// `None` falls back to English at send time.
     pub host_language: Option<String>,
+    /// Host's IANA timezone — the event type's tz when set (via `get_host_tz`),
+    /// otherwise the host user's tz. When set and different from
+    /// `guest_timezone`, host-targeted emails display the wall-clock time
+    /// converted into this zone. Empty string falls back to guest-zone display.
+    pub host_timezone: String,
 }
 
 #[derive(Default)]
@@ -82,6 +139,8 @@ pub struct CancellationDetails {
     pub cancelled_by_host: bool,
     pub guest_language: Option<String>,
     pub host_language: Option<String>,
+    /// Host's IANA timezone (from `users.timezone`). See `BookingDetails::host_timezone`.
+    pub host_timezone: String,
 }
 
 // --- HTML email template helpers ---
@@ -265,6 +324,90 @@ fn convert_to_utc(
     )
 }
 
+/// Convert a (date, start_time, end_time) tuple from `from_tz` into `to_tz`,
+/// returning the wall-clock equivalents.
+///
+/// Returns `(date, start_time, end_time)` formatted as `YYYY-MM-DD` / `HH:MM`.
+/// The date can roll over (e.g. LA 22:00 → Paris 07:00 next day), so the
+/// returned date may differ from the input. If either timezone fails to parse
+/// or the local time is invalid (DST gap), returns `None` and the caller
+/// should fall back to displaying the original values.
+fn convert_time_between_tz(
+    date: &str,
+    start_time: &str,
+    end_time: &str,
+    from_tz: &str,
+    to_tz: &str,
+) -> Option<(String, String, String)> {
+    use chrono::TimeZone;
+
+    let from: Tz = from_tz.parse().ok()?;
+    let to: Tz = to_tz.parse().ok()?;
+
+    let start_naive =
+        NaiveDateTime::parse_from_str(&format!("{} {}:00", date, start_time), "%Y-%m-%d %H:%M:%S")
+            .ok()?;
+    let end_naive =
+        NaiveDateTime::parse_from_str(&format!("{} {}:00", date, end_time), "%Y-%m-%d %H:%M:%S")
+            .ok()?;
+
+    let start_target = from
+        .from_local_datetime(&start_naive)
+        .earliest()?
+        .with_timezone(&to);
+    let end_target = from
+        .from_local_datetime(&end_naive)
+        .earliest()?
+        .with_timezone(&to);
+
+    Some((
+        start_target.format("%Y-%m-%d").to_string(),
+        start_target.format("%H:%M").to_string(),
+        end_target.format("%H:%M").to_string(),
+    ))
+}
+
+/// Build the date + time strings to display in a host-targeted email.
+///
+/// When `host_timezone` is set and differs from `guest_timezone`, the times are
+/// converted into the host's zone. Otherwise the original guest-zone values are
+/// kept. The returned `time_display` always includes a `(TZ)` suffix so the
+/// host can tell which zone they're looking at.
+pub(crate) fn host_time_display(
+    date: &str,
+    start_time: &str,
+    end_time: &str,
+    guest_timezone: &str,
+    host_timezone: &str,
+) -> (String, String) {
+    if !host_timezone.is_empty() && host_timezone != guest_timezone {
+        if let Some((host_date, host_start, host_end)) =
+            convert_time_between_tz(date, start_time, end_time, guest_timezone, host_timezone)
+        {
+            return (
+                host_date,
+                format!("{} \u{2013} {} ({})", host_start, host_end, host_timezone),
+            );
+        }
+    }
+
+    let tz_label = if !guest_timezone.is_empty() {
+        guest_timezone
+    } else if !host_timezone.is_empty() {
+        host_timezone
+    } else {
+        ""
+    };
+
+    let time_display = if tz_label.is_empty() {
+        format!("{} \u{2013} {}", start_time, end_time)
+    } else {
+        format!("{} \u{2013} {} ({})", start_time, end_time, tz_label)
+    };
+
+    (date.to_string(), time_display)
+}
+
 /// Generate an .ics VCALENDAR string for a booking
 /// Extract first name (first word) from a full name.
 fn first_name(full_name: &str) -> &str {
@@ -428,8 +571,6 @@ pub async fn send_guest_confirmation_ex(
     let ics = generate_ics(details, "REQUEST");
     let lang = guest_lang(details);
 
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
     let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
 
     let time_display = format!(
@@ -598,8 +739,11 @@ pub async fn send_guest_confirmation_ex(
         "email-confirm-subject",
         [("event", &details.event_title), ("date", &details.date)],
     );
+
+    let from = config.mailbox_from()?;
+
     let email = Message::builder()
-        .from(from)
+        .from(from.clone())
         .to(to)
         .subject(subject)
         .multipart(
@@ -613,8 +757,6 @@ pub async fn send_guest_confirmation_ex(
     // Send confirmation to additional attendees
     for attendee_email in &details.additional_attendees {
         let ics2 = generate_ics(details, "REQUEST");
-        let from2: lettre::message::Mailbox =
-            format!("{} <{}>", from_display, config.from_email).parse()?;
         let to2: lettre::message::Mailbox = attendee_email.parse()?;
         let plain2 = format!(
             "Hi,\n\n\
@@ -672,7 +814,7 @@ pub async fn send_guest_confirmation_ex(
             ContentType::parse("text/calendar; method=REQUEST; charset=UTF-8")?,
         );
         let email2 = Message::builder()
-            .from(from2)
+            .from(from.clone())
             .to(to2)
             .subject(format!(
                 "Invite: {} \u{2014} {}",
@@ -691,11 +833,15 @@ pub async fn send_guest_confirmation_ex(
 pub async fn send_host_notification(config: &SmtpConfig, details: &BookingDetails) -> Result<()> {
     let ics = generate_ics(details, "REQUEST");
 
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
 
-    let time_display = format!("{} \u{2013} {}", details.start_time, details.end_time);
+    let (date_display, time_display) = host_time_display(
+        &details.date,
+        &details.start_time,
+        &details.end_time,
+        &details.guest_timezone,
+        &details.host_timezone,
+    );
 
     let plain = format!(
         "New booking!\n\n\
@@ -707,7 +853,7 @@ pub async fn send_host_notification(config: &SmtpConfig, details: &BookingDetail
          A calendar invite is attached.\n\n\
          \u{2014} calrs",
         details.event_title,
-        details.date,
+        date_display,
         time_display,
         details.guest_name,
         details.guest_email,
@@ -730,7 +876,7 @@ pub async fn send_host_notification(config: &SmtpConfig, details: &BookingDetail
         },
         EmailRow {
             label: "Date".to_string(),
-            value: details.date.clone(),
+            value: date_display.clone(),
         },
         EmailRow {
             label: "Time".to_string(),
@@ -770,11 +916,11 @@ pub async fn send_host_notification(config: &SmtpConfig, details: &BookingDetail
     );
 
     let email = Message::builder()
-        .from(from)
+        .from(config.mailbox_from()?)
         .to(to)
         .subject(format!(
             "New booking: {} \u{2014} {} ({})",
-            details.event_title, details.guest_name, details.date
+            details.event_title, details.guest_name, date_display
         ))
         .multipart(
             MultiPart::mixed()
@@ -791,11 +937,15 @@ pub async fn send_host_booking_confirmed(
     config: &SmtpConfig,
     details: &BookingDetails,
 ) -> Result<()> {
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
 
-    let time_display = format!("{} \u{2013} {}", details.start_time, details.end_time);
+    let (date_display, time_display) = host_time_display(
+        &details.date,
+        &details.start_time,
+        &details.end_time,
+        &details.guest_timezone,
+        &details.host_timezone,
+    );
 
     let plain = format!(
         "Booking confirmed!\n\n\
@@ -807,7 +957,7 @@ pub async fn send_host_booking_confirmed(
          The event has been added to your calendar.\n\n\
          \u{2014} calrs",
         details.event_title,
-        details.date,
+        date_display,
         time_display,
         details.guest_name,
         details.guest_email,
@@ -825,7 +975,7 @@ pub async fn send_host_booking_confirmed(
         },
         EmailRow {
             label: "Date".to_string(),
-            value: details.date.clone(),
+            value: date_display.clone(),
         },
         EmailRow {
             label: "Time".to_string(),
@@ -854,11 +1004,11 @@ pub async fn send_host_booking_confirmed(
     let body = build_multipart_body(&plain, &html);
 
     let email = Message::builder()
-        .from(from)
+        .from(config.mailbox_from()?)
         .to(to)
         .subject(format!(
             "Confirmed: {} \u{2014} {} ({})",
-            details.event_title, details.guest_name, details.date
+            details.event_title, details.guest_name, date_display
         ))
         .multipart(body)?;
 
@@ -872,8 +1022,6 @@ pub async fn send_guest_reminder(
     cancel_url: Option<&str>,
 ) -> Result<()> {
     let lang = guest_lang(details);
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
     let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
 
     let time_display = format!(
@@ -976,7 +1124,7 @@ pub async fn send_guest_reminder(
         ],
     );
     let email = Message::builder()
-        .from(from)
+        .from(config.mailbox_from()?)
         .to(to)
         .subject(subject)
         .multipart(body)?;
@@ -986,11 +1134,15 @@ pub async fn send_guest_reminder(
 
 /// Send booking reminder to the host
 pub async fn send_host_reminder(config: &SmtpConfig, details: &BookingDetails) -> Result<()> {
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
 
-    let time_display = format!("{} \u{2013} {}", details.start_time, details.end_time);
+    let (date_display, time_display) = host_time_display(
+        &details.date,
+        &details.start_time,
+        &details.end_time,
+        &details.guest_timezone,
+        &details.host_timezone,
+    );
 
     let plain = format!(
         "Reminder: you have an upcoming booking.\n\n\
@@ -1001,7 +1153,7 @@ pub async fn send_host_reminder(config: &SmtpConfig, details: &BookingDetails) -
          {}\n\
          \u{2014} calrs",
         details.event_title,
-        details.date,
+        date_display,
         time_display,
         details.guest_name,
         details.guest_email,
@@ -1019,7 +1171,7 @@ pub async fn send_host_reminder(config: &SmtpConfig, details: &BookingDetails) -
         },
         EmailRow {
             label: "Date".to_string(),
-            value: details.date.clone(),
+            value: date_display.clone(),
         },
         EmailRow {
             label: "Time".to_string(),
@@ -1045,11 +1197,11 @@ pub async fn send_host_reminder(config: &SmtpConfig, details: &BookingDetails) -
     let body = build_multipart_body(&plain, &html);
 
     let email = Message::builder()
-        .from(from)
+        .from(config.mailbox_from()?)
         .to(to)
         .subject(format!(
             "Reminder: {} \u{2014} {} ({})",
-            details.event_title, details.guest_name, details.date
+            details.event_title, details.guest_name, date_display
         ))
         .multipart(body)?;
 
@@ -1064,11 +1216,16 @@ pub async fn send_guest_cancellation(
     let ics = generate_cancel_ics(details);
     let lang = details.guest_language.as_deref().unwrap_or("en");
 
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
     let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
 
-    let time_display = format!("{} \u{2013} {}", details.start_time, details.end_time);
+    let time_display = if details.guest_timezone.is_empty() {
+        format!("{} \u{2013} {}", details.start_time, details.end_time)
+    } else {
+        format!(
+            "{} \u{2013} {} ({})",
+            details.start_time, details.end_time, details.guest_timezone
+        )
+    };
 
     let greeting = ta(
         lang,
@@ -1170,7 +1327,7 @@ pub async fn send_guest_cancellation(
         [("event", &details.event_title), ("date", &details.date)],
     );
     let email = Message::builder()
-        .from(from)
+        .from(config.mailbox_from()?)
         .to(to)
         .subject(subject)
         .multipart(
@@ -1189,11 +1346,15 @@ pub async fn send_host_cancellation(
 ) -> Result<()> {
     let ics = generate_cancel_ics(details);
 
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
 
-    let time_display = format!("{} \u{2013} {}", details.start_time, details.end_time);
+    let (date_display, time_display) = host_time_display(
+        &details.date,
+        &details.start_time,
+        &details.end_time,
+        &details.guest_timezone,
+        &details.host_timezone,
+    );
     let reason_text = details
         .reason
         .as_ref()
@@ -1210,7 +1371,7 @@ pub async fn send_host_cancellation(
          A calendar cancellation is attached.\n\n\
          \u{2014} calrs",
         details.event_title,
-        details.date,
+        date_display,
         time_display,
         details.guest_name,
         details.guest_email,
@@ -1224,7 +1385,7 @@ pub async fn send_host_cancellation(
         },
         EmailRow {
             label: "Date".to_string(),
-            value: details.date.clone(),
+            value: date_display.clone(),
         },
         EmailRow {
             label: "Time".to_string(),
@@ -1262,11 +1423,11 @@ pub async fn send_host_cancellation(
     );
 
     let email = Message::builder()
-        .from(from)
+        .from(config.mailbox_from()?)
         .to(to)
         .subject(format!(
             "Cancelled: {} \u{2014} {} ({})",
-            details.event_title, details.guest_name, details.date
+            details.event_title, details.guest_name, date_display
         ))
         .multipart(
             MultiPart::mixed()
@@ -1292,8 +1453,6 @@ pub async fn send_guest_pending_notice_ex(
     cancel_url: Option<&str>,
     reschedule_url: Option<&str>,
 ) -> Result<()> {
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
     let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
 
     let time_display = format!(
@@ -1384,7 +1543,7 @@ pub async fn send_guest_pending_notice_ex(
     let body = build_multipart_body(&plain, &html);
 
     let email = Message::builder()
-        .from(from)
+        .from(config.mailbox_from()?)
         .to(to)
         .subject(format!(
             "Pending: {} \u{2014} {}",
@@ -1403,11 +1562,15 @@ pub async fn send_host_approval_request(
     confirm_token: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<()> {
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
 
-    let time_display = format!("{} \u{2013} {}", details.start_time, details.end_time);
+    let (date_display, time_display) = host_time_display(
+        &details.date,
+        &details.start_time,
+        &details.end_time,
+        &details.guest_timezone,
+        &details.host_timezone,
+    );
 
     let (approve_url, decline_url) = match (confirm_token, base_url) {
         (Some(token), Some(url)) => (
@@ -1440,7 +1603,7 @@ pub async fn send_host_approval_request(
          {}\n\n\
          \u{2014} calrs",
         details.event_title,
-        details.date,
+        date_display,
         time_display,
         details.guest_name,
         details.guest_email,
@@ -1464,7 +1627,7 @@ pub async fn send_host_approval_request(
         },
         EmailRow {
             label: "Date".to_string(),
-            value: details.date.clone(),
+            value: date_display.clone(),
         },
         EmailRow {
             label: "Time".to_string(),
@@ -1516,11 +1679,11 @@ pub async fn send_host_approval_request(
     let body = build_multipart_body(&plain, &html);
 
     let email = Message::builder()
-        .from(from)
+        .from(config.mailbox_from()?)
         .to(to)
         .subject(format!(
             "Action required: {} \u{2014} {} ({})",
-            details.event_title, details.guest_name, details.date
+            details.event_title, details.guest_name, date_display
         ))
         .multipart(body)?;
 
@@ -1532,11 +1695,16 @@ pub async fn send_guest_decline_notice(
     config: &SmtpConfig,
     details: &CancellationDetails,
 ) -> Result<()> {
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
     let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
 
-    let time_display = format!("{} \u{2013} {}", details.start_time, details.end_time);
+    let time_display = if details.guest_timezone.is_empty() {
+        format!("{} \u{2013} {}", details.start_time, details.end_time)
+    } else {
+        format!(
+            "{} \u{2013} {} ({})",
+            details.start_time, details.end_time, details.guest_timezone
+        )
+    };
     let reason_text = details
         .reason
         .as_ref()
@@ -1596,7 +1764,7 @@ pub async fn send_guest_decline_notice(
     let body = build_multipart_body(&plain, &html);
 
     let email = Message::builder()
-        .from(from)
+        .from(config.mailbox_from()?)
         .to(to)
         .subject(format!(
             "Declined: {} \u{2014} {}",
@@ -1609,18 +1777,84 @@ pub async fn send_guest_decline_notice(
 
 // --- Utility ---
 
-/// Load SMTP config from database
+const SMTP_ENV_VARS: &[&str] = &[
+    "CALRS_SMTP_HOST",
+    "CALRS_SMTP_PORT",
+    "CALRS_SMTP_TLS_MODE",
+    "CALRS_SMTP_USERNAME",
+    "CALRS_SMTP_PASSWORD",
+    "CALRS_SMTP_FROM_EMAIL",
+    "CALRS_SMTP_FROM_NAME",
+];
+
+fn required_smtp_env(name: &str) -> Result<String> {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        Ok(_) => bail!("{} must not be empty", name),
+        Err(_) => bail!(
+            "{} is required when SMTP is configured via environment",
+            name
+        ),
+    }
+}
+
+fn load_smtp_config_from_env() -> Result<Option<SmtpConfig>> {
+    if !SMTP_ENV_VARS
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        return Ok(None);
+    }
+
+    let host = required_smtp_env("CALRS_SMTP_HOST")?;
+    let username = required_smtp_env("CALRS_SMTP_USERNAME")?;
+    let password = required_smtp_env("CALRS_SMTP_PASSWORD")?;
+    let from_email = required_smtp_env("CALRS_SMTP_FROM_EMAIL")?;
+    let port = match std::env::var("CALRS_SMTP_PORT") {
+        Ok(value) if value.trim().is_empty() => bail!("CALRS_SMTP_PORT must not be empty"),
+        Ok(value) => value.trim().parse::<u16>().map_err(|_| {
+            anyhow::anyhow!("CALRS_SMTP_PORT must be a valid TCP port (got '{}')", value)
+        })?,
+        Err(_) => 587u16,
+    };
+    let tls_mode = match std::env::var("CALRS_SMTP_TLS_MODE") {
+        Ok(value) if value.trim().is_empty() => bail!("CALRS_SMTP_TLS_MODE must not be empty"),
+        Ok(value) => SmtpTlsMode::parse(&value)?,
+        Err(_) => SmtpTlsMode::StartTls,
+    };
+    let from_name = std::env::var("CALRS_SMTP_FROM_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    Ok(Some(SmtpConfig {
+        host,
+        port,
+        username,
+        password,
+        from_email,
+        from_name,
+        tls_mode,
+    }))
+}
+
+/// Load SMTP config from environment or database.
 pub async fn load_smtp_config(pool: &SqlitePool, key: &[u8; 32]) -> Result<Option<SmtpConfig>> {
-    let row: Option<(String, i32, String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT host, port, username, password_enc, from_email, from_name
+    if let Some(config) = load_smtp_config_from_env()? {
+        return Ok(Some(config));
+    }
+
+    let row: Option<(String, i32, String, String, String, Option<String>, String)> =
+        sqlx::query_as(
+            "SELECT host, port, username, password_enc, from_email, from_name, tls_mode
          FROM smtp_config WHERE enabled = 1 LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await?;
+        )
+        .fetch_optional(pool)
+        .await?;
 
     match row {
-        Some((host, port, username, password_enc, from_email, from_name)) => {
+        Some((host, port, username, password_enc, from_email, from_name, tls_mode)) => {
             let password = crate::crypto::decrypt_password(key, &password_enc)?;
+            let tls_mode = SmtpTlsMode::parse(&tls_mode).unwrap_or(SmtpTlsMode::StartTls);
             Ok(Some(SmtpConfig {
                 host,
                 port: port as u16,
@@ -1628,16 +1862,47 @@ pub async fn load_smtp_config(pool: &SqlitePool, key: &[u8; 32]) -> Result<Optio
                 password,
                 from_email,
                 from_name,
+                tls_mode,
             }))
         }
         None => Ok(None),
     }
 }
 
+/// Load non-secret SMTP status for admin display.
+///
+/// Unlike [`load_smtp_config`] this does NOT filter by `enabled = 1` — the
+/// admin panel needs to surface a disabled-but-configured row so the operator
+/// can see that SMTP exists and re-enable it. `load_smtp_config` only returns
+/// rows that are actually usable for sending, so it keeps the `WHERE enabled`
+/// guard.
+pub async fn load_smtp_status(pool: &SqlitePool) -> Result<Option<SmtpStatus>> {
+    if let Some(config) = load_smtp_config_from_env()? {
+        return Ok(Some(SmtpStatus {
+            host: config.host,
+            port: config.port,
+            from_email: config.from_email,
+            enabled: true,
+            from_env: true,
+        }));
+    }
+
+    let row: Option<(String, i32, String, bool)> =
+        sqlx::query_as("SELECT host, port, from_email, enabled FROM smtp_config LIMIT 1")
+            .fetch_optional(pool)
+            .await?;
+
+    Ok(row.map(|(host, port, from_email, enabled)| SmtpStatus {
+        host,
+        port: port as u16,
+        from_email,
+        enabled,
+        from_env: false,
+    }))
+}
+
 /// Send a test email
 pub async fn send_test_email(config: &SmtpConfig, to_email: &str) -> Result<()> {
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
     let to = to_email.parse()?;
 
     let plain = "This is a test email from calrs. SMTP is working!".to_string();
@@ -1653,11 +1918,13 @@ pub async fn send_test_email(config: &SmtpConfig, to_email: &str) -> Result<()> 
     let body = build_multipart_body(&plain, &html);
 
     let email = Message::builder()
-        .from(from)
+        .from(config.mailbox_from()?)
         .to(to)
         .subject("calrs \u{2014} SMTP test")
         .multipart(body)?;
 
+    // Debug is only useful when sending a test email
+    tracing::debug!("Sending: {:?}", email);
     send_email(config, email).await
 }
 
@@ -1672,8 +1939,7 @@ pub async fn send_invite_email(
     invite_url: &str,
     expires_at: Option<&str>,
 ) -> Result<()> {
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
+    let from = config.mailbox_from()?;
     let to = format!("{} <{}>", guest_name, guest_email).parse()?;
 
     let expiry_note = expires_at
@@ -1754,10 +2020,18 @@ pub async fn send_invite_email(
 async fn send_email(config: &SmtpConfig, email: Message) -> Result<()> {
     let creds = Credentials::new(config.username.clone(), config.password.clone());
 
-    let mailer = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.host)?
-        .port(config.port)
-        .credentials(creds)
-        .build();
+    let mailer = match config.tls_mode {
+        SmtpTlsMode::Tls => AsyncSmtpTransport::<Tokio1Executor>::relay(&config.host)?
+            .port(config.port)
+            .credentials(creds)
+            .build(),
+        SmtpTlsMode::StartTls => {
+            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.host)?
+                .port(config.port)
+                .credentials(creds)
+                .build()
+        }
+    };
 
     let to_addrs: Vec<String> = email
         .envelope()
@@ -1780,6 +2054,7 @@ async fn send_email(config: &SmtpConfig, email: Message) -> Result<()> {
 
 // --- Reschedule emails ---
 
+#[derive(Default)]
 pub struct RescheduleDetails {
     pub event_title: String,
     pub old_date: String,
@@ -1795,6 +2070,8 @@ pub struct RescheduleDetails {
     pub host_email: String,
     pub uid: String,
     pub location: Option<String>,
+    /// Host's IANA timezone (from `users.timezone`). See `BookingDetails::host_timezone`.
+    pub host_timezone: String,
 }
 
 /// Ask the guest to pick a new time (host-initiated reschedule).
@@ -1805,8 +2082,7 @@ pub async fn send_guest_pick_new_time(
     reschedule_url: &str,
     cancel_url: Option<&str>,
 ) -> Result<()> {
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
+    let from = config.mailbox_from()?;
     let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
 
     let time_display = format!(
@@ -1919,8 +2195,6 @@ pub async fn send_guest_reschedule_notification(
     };
     let ics = generate_ics(&booking_details, "REQUEST");
 
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
     let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
 
     let plain = format!(
@@ -2016,7 +2290,7 @@ pub async fn send_guest_reschedule_notification(
     );
 
     let email = Message::builder()
-        .from(from)
+        .from(config.mailbox_from()?)
         .to(to)
         .subject(format!(
             "Rescheduled: {} \u{2014} {}",
@@ -2038,13 +2312,21 @@ pub async fn send_host_reschedule_request(
     confirm_token: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<()> {
-    let new_time_display = format!(
-        "{} \u{2013} {}",
-        details.new_start_time, details.new_end_time
+    let (old_date_display, old_time_display) = host_time_display(
+        &details.old_date,
+        &details.old_start_time,
+        &details.old_end_time,
+        &details.guest_timezone,
+        &details.host_timezone,
+    );
+    let (new_date_display, new_time_display) = host_time_display(
+        &details.new_date,
+        &details.new_start_time,
+        &details.new_end_time,
+        &details.guest_timezone,
+        &details.host_timezone,
     );
 
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
 
     let (approve_url, decline_url) = match (confirm_token, base_url) {
@@ -2071,7 +2353,7 @@ pub async fn send_host_reschedule_request(
     let plain = format!(
         "{} wants to reschedule their booking.\n\n\
          Event: {}\n\
-         Previous: {} at {} \u{2013} {}\n\
+         Previous: {} at {}\n\
          Requested: {} at {}\n\
          Guest: {} <{}>\n\
          {}\n\n\
@@ -2079,10 +2361,9 @@ pub async fn send_host_reschedule_request(
          \u{2014} calrs",
         details.guest_name,
         details.event_title,
-        details.old_date,
-        details.old_start_time,
-        details.old_end_time,
-        details.new_date,
+        old_date_display,
+        old_time_display,
+        new_date_display,
         new_time_display,
         details.guest_name,
         details.guest_email,
@@ -2101,14 +2382,11 @@ pub async fn send_host_reschedule_request(
         },
         EmailRow {
             label: "Previous".to_string(),
-            value: format!(
-                "{} at {} \u{2013} {}",
-                details.old_date, details.old_start_time, details.old_end_time
-            ),
+            value: format!("{} at {}", old_date_display, old_time_display),
         },
         EmailRow {
             label: "Requested".to_string(),
-            value: format!("{} at {}", details.new_date, new_time_display),
+            value: format!("{} at {}", new_date_display, new_time_display),
         },
         EmailRow {
             label: "Guest".to_string(),
@@ -2147,7 +2425,7 @@ pub async fn send_host_reschedule_request(
     let body = build_multipart_body(&plain, &html);
 
     let email = Message::builder()
-        .from(from)
+        .from(config.mailbox_from()?)
         .to(to)
         .subject(format!(
             "Reschedule request: {} \u{2014} {} <{}>",
@@ -2168,8 +2446,6 @@ pub async fn send_watcher_claim_notification(
     assigned_to_name: &str,
     claim_url: &str,
 ) -> Result<()> {
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
     let to = format!("{} <{}>", watcher_name, watcher_email).parse()?;
 
     let time_display = format!("{} \u{2013} {}", details.start_time, details.end_time);
@@ -2245,7 +2521,7 @@ pub async fn send_watcher_claim_notification(
     let body = build_multipart_body(&plain, &html);
 
     let email = Message::builder()
-        .from(from)
+        .from(config.mailbox_from()?)
         .to(to)
         .subject(format!(
             "Claim available: {} \u{2014} {} ({})",
@@ -2262,8 +2538,6 @@ pub async fn send_claim_confirmation(
     claimant_name: &str,
     claimant_email: &str,
 ) -> Result<()> {
-    let from_display = config.from_name.as_deref().unwrap_or(&config.from_email);
-    let from = format!("{} <{}>", from_display, config.from_email).parse()?;
     let to = format!("{} <{}>", claimant_name, claimant_email).parse()?;
 
     let time_display = format!("{} \u{2013} {}", details.start_time, details.end_time);
@@ -2325,7 +2599,7 @@ pub async fn send_claim_confirmation(
     let body = build_multipart_body(&plain, &html);
 
     let email = Message::builder()
-        .from(from)
+        .from(config.mailbox_from()?)
         .to(to)
         .subject(format!(
             "Booking claimed: {} \u{2014} {} ({})",
@@ -2338,9 +2612,163 @@ pub async fn send_claim_confirmation(
 
 #[cfg(test)]
 mod tests {
+    use lettre::Address;
+
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static SMTP_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct SmtpEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        old_values: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl SmtpEnvGuard {
+        fn new() -> Self {
+            let lock = SMTP_ENV_LOCK.lock().unwrap();
+            let old_values = SMTP_ENV_VARS
+                .iter()
+                .map(|name| (*name, std::env::var(name).ok()))
+                .collect();
+            for name in SMTP_ENV_VARS {
+                std::env::remove_var(name);
+            }
+            Self {
+                _lock: lock,
+                old_values,
+            }
+        }
+    }
+
+    impl Drop for SmtpEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.old_values {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn smtp_env_error() -> String {
+        load_smtp_config_from_env()
+            .expect_err("expected SMTP env config to fail")
+            .to_string()
+    }
+
+    #[test]
+    fn smtp_config_mailbox_from() {
+        let config = SmtpConfig {
+            host: "host".to_string(),
+            port: 587,
+            username: "user".to_string(),
+            password: "password".to_string(),
+            from_name: None,
+            from_email: "username@example.com".to_string(),
+            tls_mode: SmtpTlsMode::StartTls,
+        };
+        assert_eq!(
+            config.mailbox_from().unwrap(),
+            Mailbox::new(None, Address::new("username", "example.com").unwrap()),
+            "from email with no name"
+        );
+
+        let config = SmtpConfig {
+            host: "host".to_string(),
+            port: 587,
+            username: "username".to_string(),
+            password: "password".to_string(),
+            from_name: Some("Name, With Comma".to_string()),
+            from_email: "username@example.com".to_string(),
+            tls_mode: SmtpTlsMode::StartTls,
+        };
+        assert_eq!(
+            config.mailbox_from().unwrap(),
+            Mailbox::new(
+                Some("Name, With Comma".to_string()),
+                Address::new("username", "example.com").unwrap()
+            ),
+            "from email with name"
+        );
+    }
 
     // --- sanitize_ics ---
+
+    #[test]
+    fn smtp_tls_mode_parses_supported_values() {
+        assert_eq!(
+            SmtpTlsMode::parse("starttls").unwrap(),
+            SmtpTlsMode::StartTls
+        );
+        assert_eq!(SmtpTlsMode::parse(" TLS ").unwrap(), SmtpTlsMode::Tls);
+    }
+
+    #[test]
+    fn smtp_tls_mode_rejects_unknown_values() {
+        let err = SmtpTlsMode::parse("ssl").unwrap_err().to_string();
+        assert!(err.contains("CALRS_SMTP_TLS_MODE"));
+    }
+
+    #[test]
+    fn smtp_env_absent_returns_none() {
+        let _env = SmtpEnvGuard::new();
+        assert!(load_smtp_config_from_env().unwrap().is_none());
+    }
+
+    #[test]
+    fn smtp_env_complete_defaults_to_starttls() {
+        let _env = SmtpEnvGuard::new();
+        std::env::set_var("CALRS_SMTP_HOST", "smtp.example.com");
+        std::env::set_var("CALRS_SMTP_USERNAME", "user");
+        std::env::set_var("CALRS_SMTP_PASSWORD", "secret");
+        std::env::set_var("CALRS_SMTP_FROM_EMAIL", "noreply@example.com");
+
+        let config = load_smtp_config_from_env().unwrap().unwrap();
+
+        assert_eq!(config.host, "smtp.example.com");
+        assert_eq!(config.port, 587);
+        assert_eq!(config.tls_mode, SmtpTlsMode::StartTls);
+    }
+
+    #[test]
+    fn smtp_env_partial_config_errors() {
+        let _env = SmtpEnvGuard::new();
+        std::env::set_var("CALRS_SMTP_HOST", "smtp.example.com");
+
+        let err = smtp_env_error();
+
+        assert!(err.contains("CALRS_SMTP_USERNAME"));
+    }
+
+    #[test]
+    fn smtp_env_invalid_port_errors() {
+        let _env = SmtpEnvGuard::new();
+        std::env::set_var("CALRS_SMTP_HOST", "smtp.example.com");
+        std::env::set_var("CALRS_SMTP_USERNAME", "user");
+        std::env::set_var("CALRS_SMTP_PASSWORD", "secret");
+        std::env::set_var("CALRS_SMTP_FROM_EMAIL", "noreply@example.com");
+        std::env::set_var("CALRS_SMTP_PORT", "not-a-port");
+
+        let err = smtp_env_error();
+
+        assert!(err.contains("CALRS_SMTP_PORT"));
+    }
+
+    #[test]
+    fn smtp_env_invalid_tls_mode_errors() {
+        let _env = SmtpEnvGuard::new();
+        std::env::set_var("CALRS_SMTP_HOST", "smtp.example.com");
+        std::env::set_var("CALRS_SMTP_USERNAME", "user");
+        std::env::set_var("CALRS_SMTP_PASSWORD", "secret");
+        std::env::set_var("CALRS_SMTP_FROM_EMAIL", "noreply@example.com");
+        std::env::set_var("CALRS_SMTP_TLS_MODE", "ssl");
+
+        let err = smtp_env_error();
+
+        assert!(err.contains("CALRS_SMTP_TLS_MODE"));
+    }
 
     #[test]
     fn sanitize_strips_cr_lf() {
@@ -3129,6 +3557,103 @@ mod tests {
         assert_eq!(end, "20260315T160000Z");
     }
 
+    // --- convert_time_between_tz / host_time_display tests ---
+
+    // Regression for issue #119: the host (Paris) was reading the time in the
+    // guest's wall-clock (LA), with no TZ label on cancellation emails. This
+    // verifies the LA→Paris conversion that makes the host email show 16:00
+    // Paris time when the guest booked 07:00 LA time.
+    #[test]
+    fn convert_time_between_tz_la_to_paris() {
+        let (date, start, end) = convert_time_between_tz(
+            "2026-05-26",
+            "07:00",
+            "07:30",
+            "America/Los_Angeles",
+            "Europe/Paris",
+        )
+        .expect("conversion should succeed for valid IANA names");
+        // May 26 is in PDT (UTC-7) and CEST (UTC+2), so LA 07:00 = Paris 16:00 same day.
+        assert_eq!(date, "2026-05-26");
+        assert_eq!(start, "16:00");
+        assert_eq!(end, "16:30");
+    }
+
+    // Late-evening LA booking crosses midnight into the next day in Paris.
+    #[test]
+    fn convert_time_between_tz_rolls_over_date() {
+        let (date, start, end) = convert_time_between_tz(
+            "2026-05-26",
+            "22:00",
+            "22:30",
+            "America/Los_Angeles",
+            "Europe/Paris",
+        )
+        .expect("conversion should succeed");
+        assert_eq!(date, "2026-05-27");
+        assert_eq!(start, "07:00");
+        assert_eq!(end, "07:30");
+    }
+
+    #[test]
+    fn convert_time_between_tz_invalid_zone_returns_none() {
+        assert!(convert_time_between_tz(
+            "2026-05-26",
+            "07:00",
+            "07:30",
+            "Not/A/Zone",
+            "Europe/Paris"
+        )
+        .is_none());
+        assert!(convert_time_between_tz(
+            "2026-05-26",
+            "07:00",
+            "07:30",
+            "America/Los_Angeles",
+            "Also/Bad"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn host_time_display_converts_to_host_tz() {
+        let (date, time_display) = host_time_display(
+            "2026-05-26",
+            "07:00",
+            "07:30",
+            "America/Los_Angeles",
+            "Europe/Paris",
+        );
+        assert_eq!(date, "2026-05-26");
+        assert_eq!(time_display, "16:00 \u{2013} 16:30 (Europe/Paris)");
+    }
+
+    // When host_timezone is empty (legacy callers / no users.timezone set),
+    // keep the original wall-clock and still surface *some* TZ label so the
+    // host can disambiguate. Fallback to guest_timezone.
+    #[test]
+    fn host_time_display_empty_host_tz_falls_back_to_guest_label() {
+        let (date, time_display) =
+            host_time_display("2026-05-26", "07:00", "07:30", "America/Los_Angeles", "");
+        assert_eq!(date, "2026-05-26");
+        assert_eq!(time_display, "07:00 \u{2013} 07:30 (America/Los_Angeles)");
+    }
+
+    // When both TZ values match, display the original time without conversion
+    // overhead, but still label it.
+    #[test]
+    fn host_time_display_same_tz_keeps_original_time() {
+        let (date, time_display) = host_time_display(
+            "2026-05-26",
+            "14:00",
+            "14:30",
+            "Europe/Paris",
+            "Europe/Paris",
+        );
+        assert_eq!(date, "2026-05-26");
+        assert_eq!(time_display, "14:00 \u{2013} 14:30 (Europe/Paris)");
+    }
+
     // --- ICS location field regression test ---
 
     #[test]
@@ -3336,6 +3861,7 @@ mod tests {
             host_email: "alice@example.com".to_string(),
             uid: "test-uid@calrs".to_string(),
             location: Some("https://meet.example.com/abc".to_string()),
+            ..Default::default()
         }
     }
 

@@ -137,6 +137,70 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 | Guest cancel/reschedule notice window | 1.10.0 | Per-event-type minimum lead time before a guest can self-cancel or self-reschedule via the tokenized email links; host actions from the dashboard are unaffected |
 | Estonian locale | 1.10.0 | First community-language slot added beyond the original four (English, French, Spanish, Polish, German, Italian) |
 | Admin user deletion | 1.10.0 | Admins can permanently delete users from the admin panel with cascade rules and confirmation |
+| Capped slots hidden in picker | 1.11.0 | When a frequency limit has been hit for the day/week/month/year, the slot picker skips those times instead of letting a guest pick a doomed slot |
+| Per-member booking frequency limits | 1.11.0 | Opt-in "Per team member" flag on each frequency-limit row so caps apply to individual round-robin members (e.g. 1 demo/day per person) instead of pooled team-wide |
+| Edit CalDAV sources | 1.12.0 | Fix a typo'd URL, change a username, or rotate the password from `/dashboard/sources/{id}/edit` or `calrs source update <id-prefix>`. Empty password preserves the existing one; URL changes still pass the SSRF validator |
+| SMTP via environment variables | 1.12.0 | Configure SMTP via `CALRS_SMTP_*` env vars instead of the database, useful for container deployments. Env vars take priority over the DB; partial config errors loudly |
+| SMTP implicit TLS (port 465) | 1.12.0 | New `tls_mode` column (`starttls`/`tls`) supports port 465 without the prior STARTTLS hang. Applies to both env-var and DB-configured SMTP |
+| Team event type permission cleanup | 1.12.0 | Personal event-type mutation routes can't be reached via team URLs and vice versa; centralised through `can_manage_event_type` / `find_manageable_event_type_by_slug` with 8 new regression tests covering the manageability matrix |
+
+## [1.12.1] - 2026-05-26
+
+Patch release fixing wall-clock display in host-targeted emails. A Paris organizer reading a cancellation email for a Los Angeles guest's 07:00 booking would see "07:00" with no timezone label and naturally read it as Paris time (the correct Paris-local time is 16:00). No schema changes, no behaviour changes outside the email rendering surface.
+
+### Fixed
+
+- **Host emails display the host's wall-clock with a TZ label** (closes #119, PR #120) — `send_host_notification`, `send_host_booking_confirmed`, `send_host_reminder`, `send_host_cancellation`, `send_host_approval_request`, and `send_host_reschedule_request` now convert times into the host timezone (event-type tz via `get_host_tz`, falling back to `users.timezone`) and append a `(TZ)` suffix, e.g. `16:00 – 16:30 (Europe/Paris)`. Guest cancellation and decline emails gained the TZ label they were missing (confirmation and pending notices already had it). New `convert_time_between_tz` helper handles date rollover (e.g. LA 22:00 → Paris 07:00 next day) and DST gaps.
+- **Reminder loop and reschedule "Previous" times stopped double-converting** (PR #120) — `run_reminder_loop` and `guest_reschedule_booking`'s `old_*_time` extraction pulled `start_at` raw from the DB (event-type-tz wall-clock since #101) but labeled it with `guest_timezone`. With the new host-tz conversion path, this would have shifted the displayed time twice — a 16:00 Paris booking would render as "01:00 next day" in the host reminder. Both paths now run through `booking_strings_in_guest_tz` first, matching the contract used by the cancel/confirm/decline handlers. As a bonus this also fixes a pre-existing latent bug where the guest reminder was showing host-tz wall-clock under a guest-tz label.
+- **`host_reschedule_booking` switched to `get_host_tz`** (PR #120) — was using `user.timezone` directly, inconsistent with the other 15 call sites. SELECT now includes `et.id`; resolved host timezone derives from the event type.
+
+### Internal
+
+- 677 tests total (up from 671 in 1.12.0), all green on pre-commit
+- New helpers in `src/email.rs`: `convert_time_between_tz`, `host_time_display` (both unit-tested across DST, date-rollover, invalid-zone, and same-tz cases)
+- `BookingDetails`, `CancellationDetails`, `RescheduleDetails` gain a `host_timezone: String` field
+
+## [1.12.0] - 2026-05-24
+
+A modernization pass on operator-facing surfaces: source connection details are now editable instead of delete-and-readd; SMTP gains env-var configuration and proper port-465 support; the From: mailbox stops mangling addresses without display names; and team event-type management permissions are tightened so management routes can't be reached via the read-only availability surface.
+
+### Added
+
+- **Edit CalDAV sources** (closes #72, PR #73) — `GET /dashboard/sources/{id}/edit` (form pre-filled, password field reads "Leave blank to keep existing") and `POST /dashboard/sources/{id}/edit` (apply), both scoped by `user_id`. CLI mirror: `calrs source update <id-prefix> [--name ...] [--url ...] [--username ...] [--password]`. `--password` is a flag that prompts via `rpassword` for scripted rotation. Empty password on either surface preserves the stored encrypted blob untouched. URL changes pass `validate_caldav_url` for SSRF parity between web and CLI
+- **SMTP via environment variables with TLS mode support** (PR #56) — `CALRS_SMTP_HOST`, `CALRS_SMTP_USERNAME`, `CALRS_SMTP_PASSWORD`, `CALRS_SMTP_FROM_EMAIL` required; `CALRS_SMTP_PORT` (default 587), `CALRS_SMTP_TLS_MODE` (`starttls`/`tls`), `CALRS_SMTP_FROM_NAME` optional. Env vars take priority over the DB; partial config errors loudly. New `SmtpTlsMode` enum branches `send_email` on `relay()` (implicit TLS) vs `starttls_relay()` to fix the port-465 hang. Applies to DB-configured SMTP too via new `tls_mode` column (migration 052, defaults to `'starttls'`); `calrs config smtp` prompt asks for the mode. Admin panel surfaces env-sourced status. `SmtpConfig`'s `Debug` impl now redacts the password so it can't leak through tracing or test output
+
+### Fixed
+
+- **From: mailbox handles missing display name and special characters** (PR #104) — `calrs config smtp-test` produced `Error: Invalid input` whenever `from_name` was `None`: the old fallback yielded a string like `you@example.com <you@example.com>` whose two `@`'s failed RFC 5322 parsing. All 17 send sites now build From through a new `SmtpConfig::mailbox_from()` helper using `Mailbox::new(Option<String>, Address)`, which also handles display names containing commas and other characters that need quoting. Unit test locks in both the `None` case and the `Some("Name, With Comma")` case
+- **Team event type management gated through a single capability check** (PR #55) — personal `/dashboard/event-types/{slug}/*` mutation routes now require `et.team_id IS NULL`; team-event mutation requires team admin; slug-collision resolution made deterministic via subquery + `ORDER BY (team_id IS NULL) DESC`. **Behaviour change worth noting:** `delete_invite` now strictly requires `can_manage_event_type`, so a non-admin team member who created an internal-event invite via the "any authenticated user" path can no longer delete that invite (let it expire or hit max-uses; owners, team admins, and global admins are unaffected). New `OptionalAuthUser` extractor with shared `resolve_session_user` lets public surfaces selectively widen access for logged-in viewers. Team members and global admins can now bypass the team-level invite token on public events of private teams; `team_profile_page` lists private/internal event-type titles + slugs for logged-in team members (booking stays invite-gated). 8 new regression tests cover the full manageability matrix
+
+### Internal
+
+- 671 tests total (up from 650 in 1.11.0), all green on pre-commit
+- Migration 052 (`smtp_config.tls_mode`)
+
+## [1.11.0] - 2026-05-22
+
+Two themes: closing the 1.10.2 sync-robustness hotfix loop (the three follow-ups filed against #105 / #106 / #107) and turning the booking-frequency-limits surface from a half-wired feature into a real one — first by hiding capped slots in the picker, then by adding per-team-member caps.
+
+### Added
+
+- **Hide booking slots when a frequency cap is reached** (closes #115, PR #116) — `compute_slots` now runs `apply_frequency_limit_filter` after slot generation: for each configured `(max, period)` it counts existing confirmed+pending bookings per containing host-local period, then drops slots that fall in any capped period. The submit-time check (`would_exceed_frequency_limit`) stays as a race-condition backstop, but the picker no longer shows times the submit-time check would reject. Limit-reached page also got proper styling (template render instead of bare `Html("...")`)
+- **Per-member booking frequency limits** (closes #117, PR #118) — new `booking_frequency_limits.per_member` flag (migration 051) so a host can express "1 demo/day per team member" instead of "1 demo/day team-wide". Threaded through three sites: `would_exceed_frequency_limit` takes `Option<&str> assigned_user_id` and scopes the count by assignee; `pick_group_member` excludes candidates already at their per-member cap so the picker doesn't route to a doomed user; `apply_frequency_limit_filter` hides a slot only when every eligible team member is at cap. UI gets a "Per team member" checkbox on each limit row, hidden on personal event types
+
+### Fixed
+
+- **CalDAV resource is HEAD-checked before cancelling a booking** (closes #105, PR #108) — sync-collection's "deleted" entries are now treated as a hint, not a verdict: before cancelling a confirmed booking we HEAD the resource href and only act if the server confirms 404. Two new regression tests (one for the BlueMind phantom-deletion case, one for the legitimate deletion case)
+- **`cancel_orphaned_booking` is scoped to its own source/account** (closes #106, PR #111) — previously did a global UID-only lookup against the bookings table, so a sync running on source A could cancel a booking whose CalDAV event lived under source B (different calendar, different account). Now joins through `event_types → accounts → caldav_sources` and only acts on rows whose source matches the one currently syncing
+- **Property-level 404s inside `<d:propstat>` are ignored** (closes #107, PR #109) — the sync-collection parser previously treated *any* 404 status code inside a `<d:response>` as a deletion, including the per-property 404 some servers emit when one of the requested DAV properties is absent on an otherwise-live resource. Parser now distinguishes resource-level status from propstat-level status and only routes resource-level 404s into the deletion handler
+- **Team event type frequency limits actually persist** (PR #114) — `edit_group_event_type_form` never queried `booking_frequency_limits`, and `create_group_event_type` / `update_group_event_type` never wrote to it. Toggling the cap on a team event type was a silent no-op. Three-way fix mirrors the working personal-event-type flow
+
+### Internal
+
+- 650 tests total (up from 634 in 1.10.2), all green on pre-commit
+- Migration 051 (`booking_frequency_limits.per_member`)
+- `render_claim_error` renamed to `render_booking_action_error` since the template (`booking_action_error.html`) isn't claim-specific
+- Coverage CI: `under_tarpaulin()` now uses `cfg!(tarpaulin)` (the previous `CARGO_TARPAULIN_VERSION` env-var check never fired, so the racy tracing-capture tests were leaking through the supposed-to-skip guard); `Cargo.toml` registers `cfg(tarpaulin)` via the `unexpected_cfgs` lint config
 
 ## [1.10.2] - 2026-05-14
 
