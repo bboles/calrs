@@ -117,6 +117,16 @@ CalDAV source URLs are user-supplied. `validate_caldav_url()` blocks URLs whose 
 
 This check resolves the hostname once at validation time, so a DNS-rebinding attacker who answers the initial lookup with a public IP and a subsequent lookup (during the actual HTTP fetch) with a private IP can bypass the guard. Mitigating this purely at the application layer would require inspecting the connected socket's peer address after every TCP handshake, which is outside the scope of the current implementation. The recommended deployment posture is therefore an **egress firewall** that prevents calrs from reaching RFC1918 / link-local ranges regardless of what DNS returns.
 
+#### Allowing private CalDAV hosts (self-hosting)
+
+Self-hosted deployments often run calrs and the CalDAV server on the same private network (e.g. a docker-compose stack where `http://radicale:5232` resolves to an RFC1918 address). To permit specific hostnames to resolve to private/reserved IPs, set the `CALRS_ALLOW_PRIVATE_HOSTS` environment variable to a comma-separated list of hostnames (or literal IPs):
+
+```
+CALRS_ALLOW_PRIVATE_HOSTS=radicale,nextcloud.local,127.0.0.1
+```
+
+Matching is case-insensitive and exact (no wildcards or subdomain matching). Only the listed hosts bypass the private-IP check; every other host is still validated. Keep this list as small as possible, scheme validation (http/https only) still applies.
+
 In a trusted multi-user deployment (e.g., behind OIDC) this is low risk. For public-registration instances, configure egress filtering at the network level.
 
 ## Recommendations for production

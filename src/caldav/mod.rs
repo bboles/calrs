@@ -42,7 +42,30 @@ fn is_private_ip(ip: &IpAddr) -> bool {
     }
 }
 
+/// Parse the `CALRS_ALLOW_PRIVATE_HOSTS` env var into a list of hostnames that
+/// are permitted to resolve to private/reserved IPs. Comma-separated,
+/// whitespace-trimmed, case-insensitive. Empty entries are ignored.
+fn private_host_allowlist() -> Vec<String> {
+    std::env::var("CALRS_ALLOW_PRIVATE_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect()
+}
+
+/// Whether `host` is in the configured private-host allowlist (case-insensitive).
+fn is_host_allowlisted(host: &str, allowlist: &[String]) -> bool {
+    let host = host.to_ascii_lowercase();
+    allowlist.contains(&host)
+}
+
 /// Validate a CalDAV URL: must be http(s), must not resolve to a private IP.
+///
+/// Self-hosted deployments (e.g. calrs and Radicale on the same docker network)
+/// can opt specific hostnames out of the private-IP check via the
+/// `CALRS_ALLOW_PRIVATE_HOSTS` env var (comma-separated hostnames). The check
+/// stays active for every other host.
 ///
 /// Limitation: this resolves the hostname once at validation time. A DNS
 /// rebinding attacker who returns a public IP for the initial lookup and a
@@ -64,6 +87,12 @@ pub fn validate_caldav_url(url: &str) -> Result<()> {
     let host = parsed
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("URL has no host"))?;
+
+    // Hosts the operator has explicitly opted out of the private-IP check.
+    let allowlist = private_host_allowlist();
+    if is_host_allowlisted(host, &allowlist) {
+        return Ok(());
+    }
 
     // Try parsing as IP directly
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -1498,5 +1527,45 @@ END:VCALENDAR</c:calendar-data>
 
         let principal = client.discover_principal().await.unwrap();
         assert_eq!(principal, url);
+    }
+
+    // --- private-host allowlist (SSRF opt-out) ---
+
+    #[test]
+    fn allowlist_matches_case_insensitively() {
+        let list = vec!["radicale".to_string(), "nextcloud.local".to_string()];
+        assert!(is_host_allowlisted("radicale", &list));
+        assert!(is_host_allowlisted("RADICALE", &list));
+        assert!(is_host_allowlisted("Nextcloud.Local", &list));
+        assert!(!is_host_allowlisted("evil.example.com", &list));
+        assert!(!is_host_allowlisted("radicale.example.com", &list));
+    }
+
+    #[test]
+    fn empty_allowlist_matches_nothing() {
+        assert!(!is_host_allowlisted("radicale", &[]));
+    }
+
+    /// All env-var assertions live in one test: Rust runs tests in parallel
+    /// within a process, so a second test touching the same env var would race.
+    #[test]
+    fn allowlist_env_var_opts_host_out_of_private_ip_check() {
+        // Loopback literal is rejected by default.
+        std::env::remove_var("CALRS_ALLOW_PRIVATE_HOSTS");
+        assert!(private_host_allowlist().is_empty());
+        assert!(validate_caldav_url("http://127.0.0.1:5232").is_err());
+
+        // ...but allowed once its host is on the allowlist.
+        std::env::set_var("CALRS_ALLOW_PRIVATE_HOSTS", " 127.0.0.1 , radicale ");
+        assert_eq!(private_host_allowlist(), vec!["127.0.0.1", "radicale"]);
+        assert!(validate_caldav_url("http://127.0.0.1:5232").is_ok());
+
+        // Non-http schemes are still rejected even when host is allowlisted.
+        assert!(validate_caldav_url("ftp://127.0.0.1:5232").is_err());
+
+        // A host not on the allowlist still gets the private-IP check.
+        assert!(validate_caldav_url("http://10.0.0.1").is_err());
+
+        std::env::remove_var("CALRS_ALLOW_PRIVATE_HOSTS");
     }
 }
